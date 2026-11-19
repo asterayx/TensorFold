@@ -12,9 +12,16 @@
 //               peer to peer), sets a flag there, waits for the flags in its own inbox and adds
 //   host        the same kernel with the inboxes in page-locked host memory every device maps: the way the
 //               bytes travel in upstream's mailbox backend
+//   direct, a kernel a peer
+//               the writes of `direct` as a kernel a peer, launched one after another, then the kernel that
+//               flags, waits and adds. On four cards one kernel writing to three peers was measured about ten
+//               times slower at a megabyte than these (asterayx/TensorFold#1); this row asks what that is
+//               worth in the whole exchange, launches included
+//   host, one outbox
+//               a rank writes its bytes once, into host memory every rank reads, in place of once a peer
 //   nccl        ncclAllReduce / ncclAllGather on communicators of this process (built with -DWITH_NCCL)
 //
-// All four are timed the same way, twice: `one` is one exchange launched and every device waited for, which
+// All are timed the same way, twice: `one` is one exchange launched and every device waited for, which
 // includes what launching and waiting cost; `queued` is 50 exchanges launched one after another on every
 // device and waited for once, divided by 50, which is nearer to what an exchange costs inside a pass.
 //
@@ -145,9 +152,9 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    const int ways = 4;
+    const int ways = 6;
 #else
-    const int ways = 3;
+    const int ways = 5;
 #endif
 
     std::printf("| bytes a rank | what | way | one: median | p10 | p90 | queued: median | p10 | p90 | right |\n|---:|---|---|---:|---:|---:|---:|---:|---:|---|\n");
@@ -157,9 +164,13 @@ int main(int argc, char **argv) {
         const uint64_t words = bytes / 4;
         const unsigned grid = (unsigned)std::min<uint64_t>(16, (words / 4 + 255) / 256);  // a thread a 16-byte pack, 16 blocks at most
         for (uint32_t gather = 0; gather < 2; ++gather) {
-            for (int way = 0; way < ways; ++way) {  // 0 peer copy, 1 direct, 2 host, 3 nccl
-                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : way == 2 ? "host" : "nccl";
-                if (way < 2 && !direct_ok) {
+            // 0 peer copy; 1 direct: one kernel writes into every peer's device memory; 2 host: the same into
+            // every peer's host inbox; 3 direct, a kernel a peer: the writes of 1 as a kernel a peer, one after
+            // another; 4 host, one outbox: a rank writes its words once, into host memory every rank reads; 5 nccl
+            for (int way = 0; way < ways; ++way) {
+                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : way == 2 ? "host" : way == 3 ? "direct, a kernel a peer" : way == 4 ? "host, one outbox" : "nccl";
+                const bool device_inbox = way == 1 || way == 3;
+                if ((way == 0 || device_inbox) && !direct_ok) {
                     std::printf("| %llu | %s | %s | - | - | - | - | - | - | no peer access |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
                     continue;
                 }
@@ -178,7 +189,7 @@ int main(int argc, char **argv) {
                             TRY(cudaSetDevice(devs[r]));
                             k_combine<<<(unsigned)((words + 255) / 256), 256>>>(ranks[r].mine, ranks[r].slots, ranks[r].out, words, 2 * slot_words, world, r, gather);
                         }
-                    } else if (way == 3) {
+                    } else if (way == 5) {
 #ifdef WITH_NCCL
                         // one thread issues every rank's call: a group, as NCCL asks of a thread with several devices
                         ncclGroupStart();
@@ -205,11 +216,13 @@ int main(int argc, char **argv) {
                             a.mine = ranks[r].mine;
                             a.out = ranks[r].out;
                             for (int p = 0; p < world; ++p) {
-                                a.peer_slots[p] = way == 1 ? ranks[p].slots : host_slots[p];
-                                a.peer_flags[p] = way == 1 ? ranks[p].flags : host_flags[p];
+                                a.peer_slots[p] = device_inbox ? ranks[p].slots : host_slots[way == 4 ? 0 : p];
+                                a.peer_flags[p] = device_inbox ? ranks[p].flags : host_flags[way == 4 ? 0 : p];
                             }
-                            a.my_slots = way == 1 ? ranks[r].slots : host_slots[r];
-                            a.my_flags = way == 1 ? ranks[r].flags : host_flags[r];
+                            a.my_slots = device_inbox ? ranks[r].slots : host_slots[way == 4 ? 0 : r];
+                            a.my_flags = device_inbox ? ranks[r].flags : host_flags[way == 4 ? 0 : r];
+                            a.shared = way == 4;
+                            a.sent = way == 3;
                             a.state = ranks[r].state;
                             a.words = words;
                             a.slot_words = slot_words;
@@ -218,6 +231,9 @@ int main(int argc, char **argv) {
                             a.seq = seq;
                             a.gather = gather;
                             TRY(cudaSetDevice(devs[r]));
+                            if (way == 3)
+                                for (int p = 0; p < world; ++p)
+                                    if (p != r) k_send<<<grid, 256>>>(a, (uint32_t)p);
                             k_exchange<<<grid, 256>>>(a);
                         }
                     }
@@ -230,7 +246,7 @@ int main(int argc, char **argv) {
                 };
                 auto any_failed = [&]() {
                     bool failed = false;
-                    if (way == 1 || way == 2)
+                    if (way >= 1 && way <= 4)
                         for (int r = 0; r < world; ++r) {
                             uint32_t state[2];
                             TRY(cudaSetDevice(devs[r]));
@@ -287,7 +303,7 @@ int main(int argc, char **argv) {
                             // NCCL adds the ranks in an order of its own: its sum is held to a rounding of ours
                             float have;
                             std::memcpy(&have, &got[i], 4);
-                            right = way == 3 ? std::fabs(have - sum) <= 1e-4f * (1.0f + std::fabs(sum)) : got[i] == want;
+                            right = way == 5 ? std::fabs(have - sum) <= 1e-4f * (1.0f + std::fabs(sum)) : got[i] == want;
                         }
                     }
                 }

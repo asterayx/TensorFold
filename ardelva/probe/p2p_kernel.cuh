@@ -19,6 +19,8 @@ struct Args {
     uint64_t words;
     uint64_t slot_words;
     uint32_t world, rank, seq, gather;
+    uint32_t sent;                 // k_send has already put the words: k_exchange only flags, waits and reads
+    uint32_t shared;               // every rank's slots and flags are one buffer: the words are written once
 };
 
 __device__ __forceinline__ uint32_t ld_sys(const uint32_t *p) {
@@ -55,6 +57,20 @@ __device__ __forceinline__ uint4 ld_sys_v4(const uint32_t *p) {
 }
 __device__ __forceinline__ void fence_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
 
+// This rank's words into rank r's inbox: two slots a sender, by the exchange's parity, so that the next
+// exchange's words do not land on words still read.
+__device__ __forceinline__ void put(const Args &a, uint32_t r) {
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint4 *slot = (uint4 *)(a.peer_slots[r] + ((uint64_t)a.rank * 2 + (a.seq & 1)) * a.slot_words);
+    for (uint64_t i = index; i < a.words / 4; i += stride) slot[i] = ((const uint4 *)a.mine)[i];
+}
+
+// The words to one peer and nothing else. A kernel that writes to several peers at once was measured many
+// times slower on four cards than a kernel a peer one after another (the same bytes), so a rank may launch
+// this once a peer and then k_exchange with `sent` set.
+__global__ void k_send(Args a, uint32_t r) { put(a, r); }
+
 // As mailbox.cu does it: the words go in 16-byte stores, a block's first thread counts the block done, the
 // last block's fences and sets the flags, and one thread a block waits for the peers' flags while the rest of
 // the block waits for it. `words` is a multiple of 4.
@@ -62,13 +78,12 @@ __global__ void k_exchange(Args a) {
     const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     const uint64_t packs = a.words / 4;
-    // this rank's words into every other rank's inbox: two slots a sender, by the exchange's parity, so that the
-    // next exchange's words do not land on words still read
-    for (uint32_t r = 0; r < a.world; ++r) {
-        if (r == a.rank) continue;
-        uint4 *slot = (uint4 *)(a.peer_slots[r] + ((uint64_t)a.rank * 2 + (a.seq & 1)) * a.slot_words);
-        for (uint64_t i = index; i < packs; i += stride) slot[i] = ((const uint4 *)a.mine)[i];
-    }
+    if (!a.sent)
+        for (uint32_t r = 0; r < a.world; ++r) {
+            if (r == a.rank) continue;
+            put(a, r);
+            if (a.shared) break;  // one buffer: any peer's pointer is it
+        }
     __syncthreads();
     __shared__ uint32_t failed;
     if (threadIdx.x == 0) {
@@ -76,8 +91,11 @@ __global__ void k_exchange(Args a) {
         // the block that is last to finish tells every rank the words are there
         if (add_gpu(a.state, 1) + 1 == gridDim.x) {
             fence_sys();
-            for (uint32_t r = 0; r < a.world; ++r)
-                if (r != a.rank) st_release_sys(a.peer_flags[r] + (uint64_t)a.rank * kFlagWords, a.seq);
+            for (uint32_t r = 0; r < a.world; ++r) {
+                if (r == a.rank) continue;
+                st_release_sys(a.peer_flags[r] + (uint64_t)a.rank * kFlagWords, a.seq);
+                if (a.shared) break;
+            }
             st_sys(a.state, 0);
         }
         // wait for every other rank's flag, at most two seconds; at least this exchange's number, since the
