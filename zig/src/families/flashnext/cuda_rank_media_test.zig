@@ -94,6 +94,7 @@ fn session(engine: *prompt.Engine, rank: usize, pair: *[2]c_int) !ranks.Session 
     s.collective.comm = @ptrFromInt(0x1000);
     s.collective.link = .{ .fd = pair[0] };
     s.collective.timeout_ms = 1000;
+    s.collective.spin_ns = 0;
     s.collective.lib.api.ncclBroadcast = Fake.broadcast;
     s.collective.api.ncclCommGetAsyncError = Fake.asyncError;
     s.collective.api.ncclCommAbort = Fake.abort;

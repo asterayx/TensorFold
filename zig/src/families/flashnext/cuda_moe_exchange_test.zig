@@ -23,11 +23,13 @@ const Fake = struct {
     var len: usize = 0;
     var state: nccl.Result = 0;
     var aborts: usize = 0;
+    var polls: usize = 0;
 
     fn reset() void {
         len = 0;
         state = 0;
         aborts = 0;
+        polls = 0;
     }
     fn record(c: Call) void {
         calls[len] = c;
@@ -56,6 +58,7 @@ const Fake = struct {
         return 0;
     }
     fn asyncError(_: nccl.Comm, out: *nccl.Result) callconv(.c) nccl.Result {
+        polls += 1;
         out.* = state;
         return 0;
     }
@@ -84,6 +87,7 @@ fn collective(pair: *[2]c_int, rank: usize, world: usize, timeout_ms: u64) !Coll
     c.timeout_ms = timeout_ms;
     c.rank = rank;
     c.world = world;
+    c.spin_ns = 0;
     c.lib.api.ncclAllReduce = Fake.reduce;
     c.lib.api.ncclAllGather = Fake.gather;
     c.api.ncclReduceScatter = Fake.scatter;
@@ -212,4 +216,26 @@ test "the reduce-scatter keeps the sum's contract: a dead peer, an asynchronous 
     try expectEqual(Outcome{ .err = error.RankDisconnected, .calls = 0, .aborted = true, .refused = true }, try outcome(true, .peer));
     try expectEqual(Outcome{ .err = error.NcclFailed, .calls = 1, .aborted = true, .refused = true }, try outcome(true, .async_error));
     try expectEqual(Outcome{ .err = error.RankTimeout, .calls = 1, .aborted = true, .refused = true }, try outcome(true, .stuck));
+}
+
+/// Looks at a collective that never finishes queueing, until its 20 ms deadline: how many, with `spin_ns`.
+fn stuckPolls(spin_ns: u64) !usize {
+    var pair: [2]c_int = .{ -1, -1 };
+    var c = try collective(&pair, 0, 2, 20);
+    defer close(pair);
+    c.spin_ns = spin_ns;
+    var d: cuda.Driver = undefined;
+    Fake.reset();
+    Fake.state = nccl.in_progress;
+    try std.testing.expectError(error.RankTimeout, c.sum(.{ .d = &d, .handle = null }, 0x5000_0000, 4));
+    try expect(c.failed and Fake.aborts == 1);
+    return Fake.polls;
+}
+
+test "a wait sleeps between looks unless told to spin first, and meets its deadline either way" {
+    const sleeping = try stuckPolls(0);
+    const spinning = try stuckPolls(10 * std.time.ns_per_ms);
+    // 20 ms of 50 us sleeps is 400 looks at most; half of it spent polling is many times that
+    try expect(sleeping >= 1 and sleeping <= 400);
+    try expect(spinning > 4 * sleeping);
 }

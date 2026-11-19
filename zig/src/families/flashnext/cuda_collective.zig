@@ -11,6 +11,18 @@ const Advanced = struct {
     ncclReduceScatter: @FieldType(nccl.Api, "ncclAllReduce"),
 };
 
+/// TF_FLASHNEXT_COLLECTIVE_SPIN_US: microseconds a collective's wait polls before it sleeps; unset or 0: none.
+pub fn spinNs(value: ?[]const u8) !u64 {
+    const v = value orelse return 0;
+    const us = std.fmt.parseInt(u64, v, 10) catch return error.BadCollectiveSpin;
+    if (us > 10_000) return error.BadCollectiveSpin;
+    return us * std.time.ns_per_us;
+}
+
+fn spinSetting() !u64 {
+    return spinNs(if (std.c.getenv("TF_FLASHNEXT_COLLECTIVE_SPIN_US")) |v| std.mem.span(v) else null);
+}
+
 pub const Collective = struct {
     lib: nccl.Library,
     api: Advanced,
@@ -20,11 +32,13 @@ pub const Collective = struct {
     rank: usize = 0,
     world: usize = 2,
     failed: bool = false,
+    /// How long a wait polls without sleeping before it falls back to `wire.pause` (TF_FLASHNEXT_COLLECTIVE_SPIN_US).
+    spin_ns: u64 = 0,
 
     /// `link` has completed the source/settings handshake; it stays owned by the caller.
     pub fn init(link: wire.Link, rank: usize, world: usize, timeout_ms: u64) !Collective {
         if (world < 2 or world > wire.max_ranks or rank >= world or timeout_ms == 0) return error.BadRank;
-        var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank, .world = world };
+        var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank, .world = world, .spin_ns = try spinSetting() };
         errdefer c.lib.close();
         try c.lib.requireSupportedVersion();
         const info = @typeInfo(Advanced).@"struct";
@@ -64,11 +78,21 @@ pub const Collective = struct {
         return c.lib.check(result, "NCCL nonblocking operation");
     }
 
+    /// A nonblocking communicator's call is still being queued when it returns, so the first look at its state
+    /// usually finds it in progress. With `spin_ns` zero every such look is followed by `wire.pause`, a sleep of
+    /// 50 us or more, once a collective; with it set, the wait first polls that long without sleeping. The peer
+    /// and the deadline are checked before the first poll and on every pass after the spin.
     fn wait(c: *Collective, stream: ?cuda.Stream, until: u64) !void {
         errdefer c.abort();
+        const spin_until = if (c.spin_ns == 0) 0 else wire.now() +| c.spin_ns;
+        var first = true;
         while (true) {
-            try c.link.checkPeer();
-            if (wire.now() >= until) return error.RankTimeout;
+            const spinning = !first and spin_until != 0 and wire.now() < spin_until;
+            first = false;
+            if (!spinning) {
+                try c.link.checkPeer();
+                if (wire.now() >= until) return error.RankTimeout;
+            }
             var state: nccl.Result = 0;
             try c.lib.check(c.api.ncclCommGetAsyncError(c.comm, &state), "ncclCommGetAsyncError");
             if (state != 0 and state != 7) return c.lib.check(state, "NCCL asynchronous operation");
@@ -77,7 +101,7 @@ pub const Collective = struct {
                     if (try s.done()) return;
                 } else return;
             }
-            wire.pause();
+            if (spin_until != 0 and wire.now() < spin_until) std.atomic.spinLoopHint() else wire.pause();
         }
     }
 
@@ -156,3 +180,11 @@ pub const Collective = struct {
         try c.wait(null, wire.deadline(c.timeout_ms));
     }
 };
+
+test "the collective spin setting: microseconds up to 10 ms, none when unset" {
+    try std.testing.expectEqual(@as(u64, 0), try spinNs(null));
+    try std.testing.expectEqual(@as(u64, 0), try spinNs("0"));
+    try std.testing.expectEqual(@as(u64, 200_000), try spinNs("200"));
+    try std.testing.expectError(error.BadCollectiveSpin, spinNs("10001"));
+    try std.testing.expectError(error.BadCollectiveSpin, spinNs("fast"));
+}

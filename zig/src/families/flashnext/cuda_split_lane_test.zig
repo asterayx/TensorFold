@@ -127,6 +127,7 @@ const Rig = struct {
         r.c.comm = @ptrFromInt(0x1000);
         r.c.link = .{ .fd = r.pair[0] };
         r.c.timeout_ms = 1000;
+        r.c.spin_ns = 0;
         r.c.lib.api.ncclAllReduce = Rec.allReduce;
         r.c.lib.api.ncclAllGather = Rec.gather;
         r.c.api.ncclCommGetAsyncError = Rec.asyncError;
