@@ -12,4 +12,6 @@ checks and decide nothing by themselves; a change to a transport or a kernel is 
 | file | what it measures |
 | --- | --- |
 | `probe/p2p.cu`, `probe/p2p.sh` | a small exchange between the GPUs of one host (every rank ends with the sum, or with every rank's bytes) four ways, timed the same way: `cudaMemcpyPeerAsync`, one kernel a rank writing into the peers' device memory, the same kernel through page-locked host memory (the way the bytes travel in upstream's mailbox), and NCCL (`NCCL=DIR`). One process holds the devices. |
+| `probe/p2p_ipc.cu`, `probe/p2p_ipc.sh` | the direct way of `p2p.cu` with a process a device, as TensorFold runs its ranks: each rank's inbox is device memory the others open through CUDA IPC. Whether that works across processes and devices, and what an exchange costs then. |
+| `probe/p2p_kernel.cuh` | the exchange kernel the two share. |
 | `probe/tp-suite.sh` | runs upstream's `tf-tp-test suite` (every collective bit for bit, then latency, and its decode window) for a list of devices and a backend, a process a rank, and prints its `RESULT` lines. |
