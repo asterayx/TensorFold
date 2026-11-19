@@ -1,4 +1,4 @@
-//! One two-rank NCCL owner. Nonblocking initialization and collectives observe the control peer and a deadline.
+//! One NCCL owner of 2 to 8 ranks. Nonblocking initialization and collectives observe the control peer and a deadline.
 const std = @import("std");
 const cuda = @import("cuda");
 const wire = @import("cuda_rank_wire.zig");
@@ -18,17 +18,18 @@ pub const Collective = struct {
     link: wire.Link,
     timeout_ms: u64,
     rank: usize = 0,
+    world: usize = 2,
     failed: bool = false,
 
     /// `link` has completed the source/settings handshake; it stays owned by the caller.
-    pub fn init(link: wire.Link, rank: usize, timeout_ms: u64) !Collective {
-        if (rank > 1 or timeout_ms == 0) return error.BadRank;
-        var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank };
+    pub fn init(link: wire.Link, rank: usize, world: usize, timeout_ms: u64) !Collective {
+        if (world < 2 or world > wire.max_ranks or rank >= world or timeout_ms == 0) return error.BadRank;
+        var c: Collective = .{ .lib = try nccl.Library.open(), .api = undefined, .link = link, .timeout_ms = timeout_ms, .rank = rank, .world = world };
         errdefer c.lib.close();
         try c.lib.requireSupportedVersion();
         const info = @typeInfo(Advanced).@"struct";
         inline for (info.field_names, info.field_types) |name, T| @field(c.api, name) = c.lib.lib.lookup(T, name) orelse return error.MissingSymbol;
-        var diag = cuda.p2p_report.begin(rank, 2);
+        var diag = cuda.p2p_report.begin(rank, world);
         defer diag.end();
         var id: nccl.UniqueId = undefined;
         const until = wire.deadline(timeout_ms);
@@ -38,7 +39,7 @@ pub const Collective = struct {
         } else try link.receive(std.mem.asBytes(&id), until);
         var config: nccl.Config = .{};
         errdefer c.abort();
-        try c.submitted(c.api.ncclCommInitRankConfig(&c.comm, 2, id, @intCast(rank), &config));
+        try c.submitted(c.api.ncclCommInitRankConfig(&c.comm, @intCast(world), id, @intCast(rank), &config));
         try c.wait(null, until);
         cuda.p2p_report.afterInit(&diag, .{ .lib = &c.lib, .comm = c.comm }); // no driver here: no probe
         return c;
@@ -89,7 +90,7 @@ pub const Collective = struct {
     pub fn benchmarkShape(c: *Collective) !nccl.Shape {
         if (c.failed or c.comm == null) return error.RankDisconnected;
         const actual = try c.lib.shape(c.comm);
-        if (actual.world != 2) return error.BadRank;
+        if (actual.world != c.world) return error.BadRank;
         return actual;
     }
 

@@ -8,6 +8,7 @@ const wt = @import("cuda_prompt_wt.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
 const shared = @import("cuda_batch_side.zig");
+const exchange_pad = @import("cuda_moe_exchange.zig").pad_rows;
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
 const dims = wt.dims;
@@ -302,7 +303,7 @@ pub const Scratch = struct {
     shared_out: u64 = 0,
     y: u64 = 0,
     branch: u64 = 0,
-    /// A layer's MoE output in fp32 [cap + 1, dims] when something adds to it, and the pocket's activations [cap, 128].
+    /// A layer's MoE output in fp32 [cap + exchange_pad, dims] when something adds to it, and the pocket's activations [cap, 128].
     moe_f32: u64 = 0,
     pocket_act: u64 = 0,
     ple_emb: u64 = 0,
@@ -393,10 +394,10 @@ pub const Scratch = struct {
         n += fused_rows * (idw + 2) * 4 + lanes_bytes;
         n += cap * (experts_n + 1) * 4 + pairs * 4 * 2 + pairs * 4 + items * 3 * 4 + 8 + pairs * 4 + nblk * (experts_n + 1) * 4 + pairs * 4;
         n += cap * moe_w * 6 + cap * dims * 4;
-        n += pairs * moe_w * 2 + (pairs + slots) * dims * 4 + cap * dims * 2;
+        n += pairs * moe_w * 2 + (pairs + exchange_pad * slots) * dims * 4 + cap * dims * 2;
         n += cap * dims * 2 + cap * (dims / 32) * 4 + cap * wide * 2 + cap * dims * 2 + 4 * cap * dims * 4;
         n += cap * wide * 2 * 2 + cap * streams * 4 + vocab * 2 + head_rows * vocab + half * 4 + 4096;
-        n += (cap + 1) * dims * 4 + cap * pocket_stride * 4;
+        n += (cap + exchange_pad) * dims * 4 + cap * pocket_stride * 4;
         n += cap * out_k * 4 + cap * dims * 6;
         return n;
     }
@@ -469,9 +470,9 @@ pub const Scratch = struct {
         s.shared_act = try s.add(gpa, d, cap * moe_w * 2);
         s.shared_out = try s.add(gpa, d, cap * dims * 4);
         s.moe_act = try s.add(gpa, d, pairs * moe_w * 2);
-        s.y = try s.add(gpa, d, (pairs + slots) * dims * 4); // a spare row: the exchange's odd-row pad
+        s.y = try s.add(gpa, d, (pairs + exchange_pad * slots) * dims * 4); // spare rows: the exchange's last blocks' pad
         s.branch = try s.add(gpa, d, cap * dims * 2);
-        s.moe_f32 = try s.add(gpa, d, (cap + 1) * dims * 4);
+        s.moe_f32 = try s.add(gpa, d, (cap + exchange_pad) * dims * 4);
         s.pocket_act = try s.add(gpa, d, cap * pocket_stride * 4);
         s.ple_emb = try s.add(gpa, d, cap * dims * 2);
         s.ple_xs = try s.add(gpa, d, cap * (dims / 32) * 4);

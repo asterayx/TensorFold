@@ -3,7 +3,7 @@
 /// A load this engine refuses before it serves, in words (cuda.zig asks with no engine: `explains_open`).
 pub fn open(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.FlashNextRanksOverTwo => "Flash Next on CUDA runs on one GPU or at --tp 2 (two ranks): serve with --tp 1 or --tp 2",
+        error.FlashNextRanksOverTwo => "Flash Next on CUDA runs on one GPU or at --tp 2 to 8 (a process a rank): serve with --tp 1 to --tp 8",
         error.FlashNextRanksNeedModelopt => "--tp 2 splits Flash Next's ModelOpt checkpoints only; serve this MLX checkpoint on one GPU, without --tp",
         error.FlashNextRanksOnCapturedGlue => "--tp 2 runs Flash Next's own glue, not a captured set: set TENSORFOLD_CUDA_KERNELS=native, or serve on one GPU",
         error.BadFlashNextKvPages, error.BadFlashNextPageTest, error.FlashNextPagesUnsupported, error.UnsupportedCheckpoint => explain(err),

@@ -11,7 +11,7 @@ pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u6
 }
 
 pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
-    if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+    if (world == 0 or world > @import("cuda_rank_wire.zig").max_ranks or rank >= world) return error.BadRank;
     const mode = try config.mode(gpa, io, dir);
     if (mode == .modelopt) {
         const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, rank);

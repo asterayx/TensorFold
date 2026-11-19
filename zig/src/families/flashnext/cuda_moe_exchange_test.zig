@@ -75,7 +75,7 @@ const Pass = struct {
 };
 
 /// Rank `rank`'s collective over one end of `pair`, its NCCL faked.
-fn collective(pair: *[2]c_int, rank: usize, timeout_ms: u64) !Collective {
+fn collective(pair: *[2]c_int, rank: usize, world: usize, timeout_ms: u64) !Collective {
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, pair) != 0) return error.SocketPair;
     var c: Collective = undefined;
     c.failed = false;
@@ -83,6 +83,7 @@ fn collective(pair: *[2]c_int, rank: usize, timeout_ms: u64) !Collective {
     c.link = .{ .fd = pair[0] };
     c.timeout_ms = timeout_ms;
     c.rank = rank;
+    c.world = world;
     c.lib.api.ncclAllReduce = Fake.reduce;
     c.lib.api.ncclAllGather = Fake.gather;
     c.api.ncclReduceScatter = Fake.scatter;
@@ -97,44 +98,65 @@ fn close(pair: [2]c_int) void {
     };
 }
 
-test "rounds and windows keep the all-reduce; a wider prompt pass splits, at --tp 2 only" {
-    for (1..mtp.round_rows + 1) |n| {
-        try expect(!exchange.rowSplit(2, n));
-        try expectEqual(n, exchange.clearedRows(2, n));
-    }
-    for ([_]usize{ mtp.round_rows + 1, batch.default_chunk, chunk.lone_rows, batch.max_chunk }) |n| {
-        try expect(exchange.rowSplit(2, n));
-        try expect(!exchange.rowSplit(1, n));
-        try expectEqual(n, exchange.clearedRows(1, n));
+test "rounds and windows keep the all-reduce; a wider prompt pass splits, at any --tp" {
+    for ([_]usize{ 2, 3, 4, 8 }) |w| {
+        for (1..mtp.round_rows + 1) |n| {
+            try expect(!exchange.rowSplit(w, n));
+            try expectEqual(n, exchange.clearedRows(w, n));
+        }
+        for ([_]usize{ mtp.round_rows + 1, batch.default_chunk, chunk.lone_rows, batch.max_chunk }) |n| {
+            try expect(exchange.rowSplit(w, n));
+            try expect(!exchange.rowSplit(1, n));
+            try expectEqual(n, exchange.clearedRows(1, n));
+        }
     }
 }
 
-test "the ranks' rows cover a split pass once, in blocks that pad at most the scratch's one spare row" {
+test "the ranks' rows cover a split pass once, in equal blocks whose pad stays inside the scratch's spare rows" {
+    for ([_]usize{ 2, 3, 4, 8 }) |w| {
+        var n: usize = mtp.round_rows + 1;
+        while (n <= batch.max_chunk) : (n += if (n < 600) 1 else 997) {
+            const h = exchange.block(w, n);
+            var next: usize = 0;
+            for (0..w) |r| {
+                const own = exchange.rows(w, n, r);
+                // a rank's rows start where its reduce-scatter block does, or it has none
+                try expect(own[0] == next and own[1] >= own[0] and own[1] - own[0] <= h);
+                try expect(own[0] == r * h or own[0] == n);
+                next = own[1];
+            }
+            try expectEqual(n, next);
+            try expect(exchange.clearedRows(w, n) == w * h and w * h - n < w and w * h - n <= exchange.pad_rows);
+        }
+    }
+    // two ranks: the cut it always was
     var n: usize = mtp.round_rows + 1;
-    while (n <= batch.max_chunk) : (n += if (n < 600) 1 else 997) {
-        const h = exchange.block(n);
-        const r0 = cuda.rank_scatter.share(n, 2, 0);
-        const r1 = cuda.rank_scatter.share(n, 2, 1);
-        try expect(r0[0] == 0 and r0[1] == h and r1[0] == h and r1[1] == n);
-        try expect(exchange.clearedRows(2, n) == 2 * h and 2 * h - n <= 1);
+    while (n <= 600) : (n += 1) {
+        try expectEqual(cuda.rank_scatter.share(n, 2, 0), exchange.rows(2, n, 0));
+        try expectEqual(cuda.rank_scatter.share(n, 2, 1), exchange.rows(2, n, 1));
     }
     try expectEqual(@as(usize, 2 * 8192), exchange.clearedRows(2, batch.max_chunk));
+    // four ranks, 66 rows: blocks of 17, the last rank's 15 rows and two rows of pad
+    try expectEqual([2]usize{ 51, 66 }, exchange.rows(4, 66, 3));
+    try expectEqual(@as(usize, 68), exchange.clearedRows(4, 66));
+    // eight ranks, 65 rows: blocks of 9, the last rank's two rows
+    try expectEqual([2]usize{ 63, 65 }, exchange.rows(8, 65, 7));
 }
 
 test "a split pass reduce-scatters its rank's block in place, sums that block's rows and gathers the sums in place" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Fake.launch;
     const bufs: Bufs = .{};
-    for ([_]usize{ 0, 1 }) |rank| for ([_]usize{ 65, 66, 1537, batch.default_chunk, batch.max_chunk }) |n| {
+    for ([_]usize{ 2, 4 }) |w| for (0..w) |rank| for ([_]usize{ 65, 66, 1537, batch.default_chunk, batch.max_chunk }) |n| {
         var pair: [2]c_int = .{ -1, -1 };
-        var c = try collective(&pair, rank, 1000);
+        var c = try collective(&pair, rank, w, 1000);
         defer close(pair);
         var pass: Pass = .{ .s = &bufs, .k = .{ .moe_sum = .{ .d = &d, .handle = @ptrFromInt(1) } }, .stream = .{ .d = &d, .handle = null } };
         Fake.reset();
         try exchange.run(&pass, &c, n);
-        const h = (n + 1) / 2;
+        const h = (n + w - 1) / w;
         const lo = rank * h;
-        const rows = if (rank == 0) h else n - h;
+        const rows = @min(n, lo + h) - lo;
         try expectEqual(@as(usize, 3), Fake.len);
         const rs = Fake.calls[0];
         try expect(rs.kind == .scatter and rs.f32 and rs.send == bufs.y and rs.recv == bufs.y + lo * row_y and rs.count == h * slots * dims);
@@ -153,7 +175,7 @@ const Outcome = struct { err: ?anyerror, calls: usize, aborted: bool, refused: b
 /// sum or sumBlock under one failure: what it returned, what reached NCCL, and whether it left the communicator dead.
 fn outcome(comptime block: bool, failure: enum { none, empty, peer, async_error, stuck }) !Outcome {
     var pair: [2]c_int = .{ -1, -1 };
-    var c = try collective(&pair, 1, 50);
+    var c = try collective(&pair, 1, 2, 50);
     defer close(pair);
     var d: cuda.Driver = undefined;
     const stream: cuda.Stream = .{ .d = &d, .handle = null };

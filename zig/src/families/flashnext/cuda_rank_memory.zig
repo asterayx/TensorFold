@@ -7,7 +7,7 @@ const dense_split = @import("cuda_dense_split.zig");
 const Entry = core.safetensors.Entry;
 
 pub fn estimate(a: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize) !u64 {
-    if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+    if (world == 0 or world > @import("cuda_rank_wire.zig").max_ranks or rank >= world) return error.BadRank;
     var store = try wt.Store.open(a, io, dir);
     defer store.deinit();
     const split = try dense_split.applies(&store, world);
