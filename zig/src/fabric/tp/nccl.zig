@@ -28,6 +28,15 @@ pub fn redOp(op: Op) nccl.RedOp {
     };
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// NCCL_P2P_LEVEL=SYS unless the environment already sets it, before NCCL is loaded: NCCL then writes from GPU to
+/// GPU across CPU sockets too, where by default it goes through host shared memory. On four RTX PRO 5000 (two a
+/// CPU) a 1 MiB all-reduce took 64 us that way and 90 us by default (asterayx/TensorFold#1); no model was run.
+pub fn allowPeerAcrossCpus() void {
+    _ = setenv("NCCL_P2P_LEVEL", "SYS", 0);
+}
+
 pub const Nccl = struct {
     lib: *const nccl.Library,
     d: *const cuda.Driver,

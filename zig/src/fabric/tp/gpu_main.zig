@@ -103,7 +103,7 @@ fn suite(s: *tp.Session, d: *const cuda.Driver, gpa: std.mem.Allocator, cfg: tp.
     var n_backends: usize = 1;
     backends[0] = .{ .comm = s.nccl.iface(), .label = "nccl" };
     if (s.comm().kind() != .nccl) {
-        backends[1] = .{ .comm = s.comm(), .label = if (s.roceLink() != null) "roce" else "mailbox" };
+        backends[1] = .{ .comm = s.comm(), .label = if (s.roceLink() != null) "roce" else if (s.out != null) "outbox" else "mailbox" };
         n_backends = 2;
     } else if (cfg.backend != .nccl and cfg.rank == 0) {
         std.debug.print("WARN TF_COMM_BACKEND={t} fell back to NCCL (see the [tensorfold] tp log lines above): only NCCL is measured\n", .{cfg.backend});
