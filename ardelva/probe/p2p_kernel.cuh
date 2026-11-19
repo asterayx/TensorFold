@@ -21,6 +21,8 @@ struct Args {
     uint32_t world, rank, seq, gather;
     uint32_t sent;                 // k_send has already put the words: k_exchange only flags, waits and reads
     uint32_t shared;               // every rank's slots and flags are one buffer: the words are written once
+    uint32_t wt;                   // the words go with __stwt (st.global.wt; on sm_120 STG.E.128.STRONG.SYS), not a plain store
+    uint32_t unroll;               // a thread loads four packs, then stores four, in place of one and one
 };
 
 __device__ __forceinline__ uint32_t ld_sys(const uint32_t *p) {
@@ -63,7 +65,38 @@ __device__ __forceinline__ void put(const Args &a, uint32_t r) {
     const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
     uint4 *slot = (uint4 *)(a.peer_slots[r] + ((uint64_t)a.rank * 2 + (a.seq & 1)) * a.slot_words);
-    for (uint64_t i = index; i < a.words / 4; i += stride) slot[i] = ((const uint4 *)a.mine)[i];
+    const uint4 *mine = (const uint4 *)a.mine;
+    const uint64_t packs = a.words / 4;
+    if (!a.unroll) {
+        for (uint64_t i = index; i < packs; i += stride) {
+            const uint4 v = mine[i];
+            if (a.wt) __stwt(slot + i, v);
+            else slot[i] = v;
+        }
+        return;
+    }
+    // four loads, then four stores: more writes on their way at once (the packs past a multiple of four go one
+    // a thread, after)
+    const uint64_t whole = packs & ~(uint64_t)3;
+    for (uint64_t i = index * 4; i < whole; i += stride * 4) {
+        const uint4 v0 = mine[i], v1 = mine[i + 1], v2 = mine[i + 2], v3 = mine[i + 3];
+        if (a.wt) {
+            __stwt(slot + i, v0);
+            __stwt(slot + i + 1, v1);
+            __stwt(slot + i + 2, v2);
+            __stwt(slot + i + 3, v3);
+        } else {
+            slot[i] = v0;
+            slot[i + 1] = v1;
+            slot[i + 2] = v2;
+            slot[i + 3] = v3;
+        }
+    }
+    if (index < packs - whole) {
+        const uint4 v = mine[whole + index];
+        if (a.wt) __stwt(slot + whole + index, v);
+        else slot[whole + index] = v;
+    }
 }
 
 // The words to one peer and nothing else. A kernel that writes to several peers at once was measured many

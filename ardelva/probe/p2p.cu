@@ -19,6 +19,10 @@
 //               worth in the whole exchange, launches included
 //   host, one outbox
 //               a rank writes its bytes once, into host memory every rank reads, in place of once a peer
+//   direct, wt / direct, 4 at once / direct, wt, 4 at once
+//               `direct` with its words stored by __stwt (st.global.wt, which nvcc 13 turns into
+//               STG.E.128.STRONG.SYS for sm_120 where a plain store is STG.E.128), with four packs loaded and
+//               then four stored by a thread, and with both
 //   nccl        ncclAllReduce / ncclAllGather on communicators of this process (built with -DWITH_NCCL)
 //
 // All are timed the same way, twice: `one` is one exchange launched and every device waited for, which
@@ -152,9 +156,9 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    const int ways = 6;
+    const int ways = 9;
 #else
-    const int ways = 5;
+    const int ways = 8;
 #endif
 
     std::printf("| bytes a rank | what | way | one: median | p10 | p90 | queued: median | p10 | p90 | right |\n|---:|---|---|---:|---:|---:|---:|---:|---:|---|\n");
@@ -168,8 +172,8 @@ int main(int argc, char **argv) {
             // every peer's host inbox; 3 direct, a kernel a peer: the writes of 1 as a kernel a peer, one after
             // another; 4 host, one outbox: a rank writes its words once, into host memory every rank reads; 5 nccl
             for (int way = 0; way < ways; ++way) {
-                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : way == 2 ? "host" : way == 3 ? "direct, a kernel a peer" : way == 4 ? "host, one outbox" : "nccl";
-                const bool device_inbox = way == 1 || way == 3;
+                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : way == 2 ? "host" : way == 3 ? "direct, a kernel a peer" : way == 4 ? "host, one outbox" : way == 5 ? "direct, wt" : way == 6 ? "direct, 4 at once" : way == 7 ? "direct, wt, 4 at once" : "nccl";
+                const bool device_inbox = way == 1 || way == 3 || (way >= 5 && way <= 7);
                 if ((way == 0 || device_inbox) && !direct_ok) {
                     std::printf("| %llu | %s | %s | - | - | - | - | - | - | no peer access |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
                     continue;
@@ -189,7 +193,7 @@ int main(int argc, char **argv) {
                             TRY(cudaSetDevice(devs[r]));
                             k_combine<<<(unsigned)((words + 255) / 256), 256>>>(ranks[r].mine, ranks[r].slots, ranks[r].out, words, 2 * slot_words, world, r, gather);
                         }
-                    } else if (way == 5) {
+                    } else if (way == 8) {
 #ifdef WITH_NCCL
                         // one thread issues every rank's call: a group, as NCCL asks of a thread with several devices
                         ncclGroupStart();
@@ -223,6 +227,8 @@ int main(int argc, char **argv) {
                             a.my_flags = device_inbox ? ranks[r].flags : host_flags[way == 4 ? 0 : r];
                             a.shared = way == 4;
                             a.sent = way == 3;
+                            a.wt = way == 5 || way == 7;
+                            a.unroll = way == 6 || way == 7;
                             a.state = ranks[r].state;
                             a.words = words;
                             a.slot_words = slot_words;
@@ -246,7 +252,7 @@ int main(int argc, char **argv) {
                 };
                 auto any_failed = [&]() {
                     bool failed = false;
-                    if (way >= 1 && way <= 4)
+                    if (way >= 1 && way <= 7)
                         for (int r = 0; r < world; ++r) {
                             uint32_t state[2];
                             TRY(cudaSetDevice(devs[r]));
@@ -303,7 +309,7 @@ int main(int argc, char **argv) {
                             // NCCL adds the ranks in an order of its own: its sum is held to a rounding of ours
                             float have;
                             std::memcpy(&have, &got[i], 4);
-                            right = way == 5 ? std::fabs(have - sum) <= 1e-4f * (1.0f + std::fabs(sum)) : got[i] == want;
+                            right = way == 8 ? std::fabs(have - sum) <= 1e-4f * (1.0f + std::fabs(sum)) : got[i] == want;
                         }
                     }
                 }
