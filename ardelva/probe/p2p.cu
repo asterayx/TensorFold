@@ -10,12 +10,19 @@
 //   peer copy   cudaMemcpyPeerAsync of every rank's bytes to every other rank, then a kernel a rank that adds
 //   direct      one kernel a rank: it writes its bytes into an inbox in each other rank's device memory (PCIe
 //               peer to peer), sets a flag there, waits for the flags in its own inbox and adds
-//   host        the same kernel with the inboxes in page-locked host memory every device maps
+//   host        the same kernel with the inboxes in page-locked host memory every device maps: the way the
+//               bytes travel in upstream's mailbox backend
+//   nccl        ncclAllReduce / ncclAllGather on communicators of this process (built with -DWITH_NCCL)
+//
+// All four are timed the same way, twice: `one` is one exchange launched and every device waited for, which
+// includes what launching and waiting cost; `queued` is 50 exchanges launched one after another on every
+// device and waited for once, divided by 50, which is nearer to what an exchange costs inside a pass.
 //
 // The kernel's orderings (system-scope loads and stores, the flag after the data, a counter that tells the last
 // thread) follow zig/src/fabric/tp/mailbox.cu, which does the host form for two ranks in two processes.
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,13 +31,28 @@
 
 #include <cuda_runtime.h>
 
+#ifdef WITH_NCCL
+// NCCL's few entry points used here, declared so that its header is not needed to build (values as in nccl.h).
+extern "C" {
+typedef struct ncclComm *ncclComm_t;
+int ncclCommInitAll(ncclComm_t *comms, int ndev, const int *devlist);
+int ncclCommDestroy(ncclComm_t comm);
+int ncclAllReduce(const void *sendbuff, void *recvbuff, size_t count, int datatype, int op, ncclComm_t comm, cudaStream_t stream);
+int ncclAllGather(const void *sendbuff, void *recvbuff, size_t sendcount, int datatype, ncclComm_t comm, cudaStream_t stream);
+int ncclGroupStart(void);
+int ncclGroupEnd(void);
+const char *ncclGetErrorString(int result);
+}
+static const int kNcclFloat32 = 7, kNcclSum = 0;
+#endif
+
 static const int kMost = 8;
 static const int kFlagWords = 32;  // a flag to a 128-byte line
 
 struct Args {
     const uint32_t *mine;          // this rank's words (device)
     uint32_t *out;                 // the sum, or world x words gathered
-    uint32_t *peer_slots[kMost];   // rank r's inbox data as this device reaches it: [sender][words]
+    uint32_t *peer_slots[kMost];   // rank r's inbox data as this device reaches it: [sender][seq & 1][words]
     uint32_t *peer_flags[kMost];   // rank r's inbox flags: [sender * kFlagWords]
     const uint32_t *my_slots;      // this rank's inbox data
     const uint32_t *my_flags;      // this rank's inbox flags
@@ -73,7 +95,8 @@ __global__ void k_exchange(Args a) {
     // this rank's words into every other rank's inbox
     for (uint32_t r = 0; r < a.world; ++r) {
         if (r == a.rank) continue;
-        uint32_t *slot = a.peer_slots[r] + (uint64_t)a.rank * a.slot_words;
+        // two slots a sender, by the exchange's parity: the next exchange's words do not land on words still read
+        uint32_t *slot = a.peer_slots[r] + ((uint64_t)a.rank * 2 + (a.seq & 1)) * a.slot_words;
         for (uint64_t i = index; i < a.words; i += stride) st_sys(slot + i, a.mine[i]);
     }
     // the thread that is last to finish tells every rank the words are there
@@ -86,7 +109,8 @@ __global__ void k_exchange(Args a) {
     const uint64_t until = timer_ns() + 2000000000ull;
     for (uint32_t r = 0; r < a.world; ++r) {
         if (r == a.rank) continue;
-        while (ld_acquire_sys(a.my_flags + (uint64_t)r * kFlagWords) != a.seq) {
+        // at least this exchange's number: the sender may already have flagged its next
+        while (ld_acquire_sys(a.my_flags + (uint64_t)r * kFlagWords) < a.seq) {
             if (timer_ns() > until) {
                 a.state[1] = 1;
                 return;
@@ -96,11 +120,11 @@ __global__ void k_exchange(Args a) {
     for (uint64_t i = index; i < a.words; i += stride) {
         if (a.gather) {
             for (uint32_t r = 0; r < a.world; ++r)
-                a.out[(uint64_t)r * a.words + i] = r == a.rank ? a.mine[i] : ld_sys(a.my_slots + (uint64_t)r * a.slot_words + i);
+                a.out[(uint64_t)r * a.words + i] = r == a.rank ? a.mine[i] : ld_sys(a.my_slots + ((uint64_t)r * 2 + (a.seq & 1)) * a.slot_words + i);
         } else {
             float sum = 0.0f;
             for (uint32_t r = 0; r < a.world; ++r)
-                sum += __uint_as_float(r == a.rank ? a.mine[i] : ld_sys(a.my_slots + (uint64_t)r * a.slot_words + i));
+                sum += __uint_as_float(r == a.rank ? a.mine[i] : ld_sys(a.my_slots + ((uint64_t)r * 2 + (a.seq & 1)) * a.slot_words + i));
             a.out[i] = __float_as_uint(sum);
         }
     }
@@ -167,7 +191,7 @@ int main(int argc, char **argv) {
         }
         std::printf("\n");
     }
-    std::printf("\nEach exchange is timed from before the first launch to after every device is waited for; microseconds.\n\n");
+    std::printf("\nMicroseconds. `one`: an exchange launched and every device waited for. `queued`: 50 launched one after another, waited for once, a fiftieth of it.\n\n");
 
     // device memory of each rank, and host inboxes every device maps
     std::vector<Rank> ranks(world);
@@ -179,7 +203,7 @@ int main(int argc, char **argv) {
         TRY(cudaSetDevice(k.dev));
         TRY(cudaMalloc(&k.mine, most_words * 4));
         TRY(cudaMalloc(&k.out, most_words * 4 * world));
-        TRY(cudaMalloc(&k.slots, slot_words * 4 * world));
+        TRY(cudaMalloc(&k.slots, slot_words * 4 * world * 2));
         TRY(cudaMalloc(&k.flags, (size_t)kFlagWords * 4 * world));
         TRY(cudaMalloc(&k.state, 256));
         TRY(cudaMemset(k.flags, 0, (size_t)kFlagWords * 4 * world));
@@ -189,40 +213,74 @@ int main(int argc, char **argv) {
             std::memcpy(&host_mine[r][i], &v, 4);
         }
         TRY(cudaMemcpy(k.mine, host_mine[r].data(), most_words * 4, cudaMemcpyHostToDevice));
-        TRY(cudaHostAlloc(&host_slots[r], slot_words * 4 * world, cudaHostAllocPortable | cudaHostAllocMapped));
+        TRY(cudaHostAlloc(&host_slots[r], slot_words * 4 * world * 2, cudaHostAllocPortable | cudaHostAllocMapped));
         TRY(cudaHostAlloc(&host_flags[r], (size_t)kFlagWords * 4 * world, cudaHostAllocPortable | cudaHostAllocMapped));
         std::memset(host_flags[r], 0, (size_t)kFlagWords * 4 * world);
     }
 
-    std::printf("| bytes a rank | what | way | median | p10 | p90 | right |\n|---:|---|---|---:|---:|---:|---|\n");
+#ifdef WITH_NCCL
+    std::vector<ncclComm_t> comms(world);
+    {
+        const int rc = ncclCommInitAll(comms.data(), world, devs.data());
+        if (rc != 0) {
+            std::fprintf(stderr, "ncclCommInitAll: %s\n", ncclGetErrorString(rc));
+            return 2;
+        }
+    }
+    const int ways = 4;
+#else
+    const int ways = 3;
+#endif
+
+    std::printf("| bytes a rank | what | way | one: median | p10 | p90 | queued: median | p10 | p90 | right |\n|---:|---|---|---:|---:|---:|---:|---:|---:|---|\n");
     uint32_t seq = 0;
     const uint64_t sizes[] = {5120, 10240, 40960, 163840, 1u << 20};
     for (uint64_t bytes : sizes) {
         const uint64_t words = bytes / 4;
         const unsigned grid = (unsigned)std::min<uint64_t>(16, (words + 255) / 256);
         for (uint32_t gather = 0; gather < 2; ++gather) {
-            for (int way = 0; way < 3; ++way) {  // 0 peer copy, 1 direct, 2 host
-                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : "host";
-                if (way != 2 && !direct_ok) {
-                    std::printf("| %llu | %s | %s | - | - | - | no peer access |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
+            for (int way = 0; way < ways; ++way) {  // 0 peer copy, 1 direct, 2 host, 3 nccl
+                const char *name = way == 0 ? "peer copy" : way == 1 ? "direct" : way == 2 ? "host" : "nccl";
+                if (way < 2 && !direct_ok) {
+                    std::printf("| %llu | %s | %s | - | - | - | - | - | - | no peer access |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
                     continue;
                 }
-                std::vector<double> us;
-                bool failed = false;
-                for (int it = 0; it < 20 + repeats && !failed; ++it) {
+                // one exchange on every device, launched and not waited for
+                auto launch = [&]() {
                     ++seq;
-                    const auto start = std::chrono::steady_clock::now();
                     if (way == 0) {
-                        for (int s = 0; s < world; ++s)
+                        // the copies land in the slots of even parity, which k_combine reads
+                        for (int src = 0; src < world; ++src)
                             for (int d = 0; d < world; ++d)
-                                if (s != d) {
+                                if (src != d) {
                                     TRY(cudaSetDevice(devs[d]));
-                                    TRY(cudaMemcpyPeerAsync(ranks[d].slots + (uint64_t)s * slot_words, devs[d], ranks[s].mine, devs[s], bytes, 0));
+                                    TRY(cudaMemcpyPeerAsync(ranks[d].slots + (uint64_t)src * 2 * slot_words, devs[d], ranks[src].mine, devs[src], bytes, 0));
                                 }
                         for (int r = 0; r < world; ++r) {
                             TRY(cudaSetDevice(devs[r]));
-                            k_combine<<<(unsigned)((words + 255) / 256), 256>>>(ranks[r].mine, ranks[r].slots, ranks[r].out, words, slot_words, world, r, gather);
+                            k_combine<<<(unsigned)((words + 255) / 256), 256>>>(ranks[r].mine, ranks[r].slots, ranks[r].out, words, 2 * slot_words, world, r, gather);
                         }
+                    } else if (way == 3) {
+#ifdef WITH_NCCL
+                        // one thread issues every rank's call: a group, as NCCL asks of a thread with several devices
+                        ncclGroupStart();
+                        for (int r = 0; r < world; ++r) {
+                            TRY(cudaSetDevice(devs[r]));
+                            const int rc = gather ? ncclAllGather(ranks[r].mine, ranks[r].out, words, kNcclFloat32, comms[r], 0)
+                                                  : ncclAllReduce(ranks[r].mine, ranks[r].out, words, kNcclFloat32, kNcclSum, comms[r], 0);
+                            if (rc != 0) {
+                                std::fprintf(stderr, "nccl: %s\n", ncclGetErrorString(rc));
+                                std::exit(2);
+                            }
+                        }
+                        {
+                            const int rc = ncclGroupEnd();
+                            if (rc != 0) {
+                                std::fprintf(stderr, "ncclGroupEnd: %s\n", ncclGetErrorString(rc));
+                                std::exit(2);
+                            }
+                        }
+#endif
                     } else {
                         for (int r = 0; r < world; ++r) {
                             Args a = {};
@@ -245,22 +303,45 @@ int main(int argc, char **argv) {
                             k_exchange<<<grid, 256>>>(a);
                         }
                     }
+                };
+                auto wait_all = [&]() {
                     for (int r = 0; r < world; ++r) {
                         TRY(cudaSetDevice(devs[r]));
                         TRY(cudaDeviceSynchronize());
                     }
-                    const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-                    if (it >= 20) us.push_back(t);
-                    if (way != 0)
+                };
+                auto any_failed = [&]() {
+                    bool failed = false;
+                    if (way == 1 || way == 2)
                         for (int r = 0; r < world; ++r) {
                             uint32_t state[2];
                             TRY(cudaSetDevice(devs[r]));
                             TRY(cudaMemcpy(state, ranks[r].state, 8, cudaMemcpyDeviceToHost));
                             if (state[1]) failed = true;
                         }
+                    return failed;
+                };
+                const int queue = 50;
+                std::vector<double> one, queued;
+                bool failed = false;
+                for (int it = 0; it < 20 + repeats && !failed; ++it) {
+                    const auto start = std::chrono::steady_clock::now();
+                    launch();
+                    wait_all();
+                    const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                    if (it >= 20) one.push_back(t);
+                    failed = any_failed();
+                }
+                for (int it = 0; it < 3 + repeats / 10 && !failed; ++it) {
+                    const auto start = std::chrono::steady_clock::now();
+                    for (int q = 0; q < queue; ++q) launch();
+                    wait_all();
+                    const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                    if (it >= 3) queued.push_back(t / queue);
+                    failed = any_failed();
                 }
                 if (failed) {
-                    std::printf("| %llu | %s | %s | - | - | - | a rank waited two seconds for a flag |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
+                    std::printf("| %llu | %s | %s | - | - | - | - | - | - | a rank waited two seconds for a flag |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name);
                     for (int r = 0; r < world; ++r) {
                         TRY(cudaSetDevice(devs[r]));
                         TRY(cudaMemset(ranks[r].state, 0, 256));
@@ -275,27 +356,35 @@ int main(int argc, char **argv) {
                     TRY(cudaMemcpy(got.data(), ranks[r].out, words * 4 * (gather ? world : 1), cudaMemcpyDeviceToHost));
                     for (uint64_t i = 0; i < words && right; ++i) {
                         if (gather) {
-                            for (int s = 0; s < world; ++s) right = right && got[(uint64_t)s * words + i] == host_mine[s][i];
+                            for (int src = 0; src < world; ++src) right = right && got[(uint64_t)src * words + i] == host_mine[src][i];
                         } else {
                             float sum = 0.0f;
-                            for (int s = 0; s < world; ++s) {
+                            for (int src = 0; src < world; ++src) {
                                 float v;
-                                std::memcpy(&v, &host_mine[s][i], 4);
+                                std::memcpy(&v, &host_mine[src][i], 4);
                                 sum += v;
                             }
                             uint32_t want;
                             std::memcpy(&want, &sum, 4);
-                            right = got[i] == want;
+                            // NCCL adds the ranks in an order of its own: its sum is held to a rounding of ours
+                            float have;
+                            std::memcpy(&have, &got[i], 4);
+                            right = way == 3 ? std::fabs(have - sum) <= 1e-4f * (1.0f + std::fabs(sum)) : got[i] == want;
                         }
                     }
                 }
-                std::sort(us.begin(), us.end());
-                std::printf("| %llu | %s | %s | %.1f | %.1f | %.1f | %s |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name,
-                            us[us.size() / 2], us[us.size() / 10], us[us.size() * 9 / 10], right ? "yes" : "NO");
+                std::sort(one.begin(), one.end());
+                std::sort(queued.begin(), queued.end());
+                std::printf("| %llu | %s | %s | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f | %s |\n", (unsigned long long)bytes, gather ? "gather" : "sum", name,
+                            one[one.size() / 2], one[one.size() / 10], one[one.size() * 9 / 10],
+                            queued[queued.size() / 2], queued[queued.size() / 10], queued[queued.size() * 9 / 10], right ? "yes" : "NO");
                 std::fflush(stdout);
             }
         }
     }
+#ifdef WITH_NCCL
+    for (ncclComm_t comm : comms) ncclCommDestroy(comm);
+#endif
     std::printf("\n");
     return 0;
 }
