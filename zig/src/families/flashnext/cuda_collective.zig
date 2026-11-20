@@ -11,9 +11,12 @@ const Advanced = struct {
     ncclReduceScatter: @FieldType(nccl.Api, "ncclAllReduce"),
 };
 
-/// TF_FLASHNEXT_COLLECTIVE_SPIN_US: microseconds a collective's wait polls before it sleeps; unset or 0: none.
+/// TF_FLASHNEXT_COLLECTIVE_SPIN_US: microseconds a collective's wait polls before it sleeps; unset: 200, 0: none.
+/// On xzss at --tp 2 with the dense split, 200 took a decode forward from 28.8 to 14.5 ms (asterayx/TensorFold#4).
+pub const default_spin_us = 200;
+
 pub fn spinNs(value: ?[]const u8) !u64 {
-    const v = value orelse return 0;
+    const v = value orelse return default_spin_us * std.time.ns_per_us;
     const us = std.fmt.parseInt(u64, v, 10) catch return error.BadCollectiveSpin;
     if (us > 10_000) return error.BadCollectiveSpin;
     return us * std.time.ns_per_us;
@@ -35,7 +38,7 @@ pub const Collective = struct {
     world: usize = 2,
     failed: bool = false,
     /// How long a wait polls without sleeping before it falls back to `wire.pause` (TF_FLASHNEXT_COLLECTIVE_SPIN_US).
-    spin_ns: u64 = 0,
+    spin_ns: u64 = default_spin_us * std.time.ns_per_us,
     /// The ranks' small gathers and sums as one kernel a rank, when every rank set it up (cuda_box.zig).
     box: ?Box = null,
 
@@ -94,7 +97,7 @@ pub const Collective = struct {
 
     /// A nonblocking communicator's call is still being queued when it returns, so the first look at its state
     /// usually finds it in progress. With `spin_ns` zero every such look is followed by `wire.pause`, a sleep of
-    /// 50 us or more, once a collective; with it set, the wait first polls that long without sleeping. The peer
+    /// 50 us or more, once a collective; otherwise the wait first polls that long without sleeping. The peer
     /// and the deadline are checked before the first poll and on every pass after the spin.
     fn wait(c: *Collective, stream: ?cuda.Stream, until: u64) !void {
         errdefer c.abort();
@@ -211,8 +214,8 @@ test {
     _ = @import("cuda_box.zig");
 }
 
-test "the collective spin setting: microseconds up to 10 ms, none when unset" {
-    try std.testing.expectEqual(@as(u64, 0), try spinNs(null));
+test "the collective spin setting: microseconds up to 10 ms, 200 when unset, none at 0" {
+    try std.testing.expectEqual(@as(u64, 200_000), try spinNs(null));
     try std.testing.expectEqual(@as(u64, 0), try spinNs("0"));
     try std.testing.expectEqual(@as(u64, 200_000), try spinNs("200"));
     try std.testing.expectError(error.BadCollectiveSpin, spinNs("10001"));

@@ -1,8 +1,9 @@
 # Flash Next's small collectives as one kernel a rank
 
-`TF_FLASHNEXT_COLLECTIVE_BOX=1` on every rank sends the ranks' gathers and fp32 sums of at most
-`TF_FLASHNEXT_COLLECTIVE_BOX_KB` (default 256) KiB a rank through one kernel a rank instead of an NCCL call. Off by
-default: every collective is NCCL's, as upstream.
+The ranks' gathers and fp32 sums of at most `TF_FLASHNEXT_COLLECTIVE_BOX_KB` (default 256) KiB a rank go through one
+kernel a rank instead of an NCCL call. On by default; `TF_FLASHNEXT_COLLECTIVE_BOX=0` on any rank keeps every
+collective on NCCL, as upstream. `TF_FLASHNEXT_COLLECTIVE_SPIN_US` (default 200, 0 for upstream's sleep) is how long
+a wait for an NCCL call polls before it sleeps.
 
 ## Why
 
@@ -42,8 +43,8 @@ Not with `TF_FLASHNEXT_DECODE_GRAPH=1`: a captured launch would replay one excha
 
 ## What is and is not known
 
-Verified without a GPU: the kernel builds for sm_80, 86, 120 and 121 with no stack frame and no spills; host tests
-of the routing, the kernel's arguments and the failure record pass and fail when broken on purpose.
+Measured on xzss, cards 0,1 at `--tp 2` and 0,1,4,5 at `--tp 4`, short prompts (asterayx/TensorFold#6): token
+fingerprints equal to the NCCL path's for all 232 compared requests; with the dense split a decode forward went from
+14.5 to 11.8 ms; with the dense layers whole, at two and at four ranks, no measurable change.
 
-Not run on a GPU: the kernel itself, the region's setup, and any speed. The checks that count are token
-fingerprints equal to the NCCL path's for the same requests, and the forward's time with it on and off.
+Not yet done: a rank killed on purpose mid-request on a GPU, and the full benchmark's long prompts and concurrency.
