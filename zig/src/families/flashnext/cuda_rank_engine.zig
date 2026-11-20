@@ -1,4 +1,4 @@
-//! Leader-owned operations replayed on the other CUDA rank; sequence and cache identities survive map relocation.
+//! Leader-owned operations replayed on every other CUDA rank; sequence and cache identities survive map relocation.
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("cuda_prompt.zig");
@@ -8,6 +8,9 @@ const Collective = @import("cuda_collective.zig").Collective;
 const wt = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
 const verify_rows = @import("cuda_rank_verify.zig");
+
+/// Ranks of one group at most (the control link's).
+pub const max_ranks = wire.max_ranks;
 
 pub const Identity = extern struct {
     config: [32]u8,
@@ -22,6 +25,8 @@ pub const Identity = extern struct {
     image_tokens: u64 = 0,
     max_images: u64 = 0,
     dense_split: u64 = 0,
+    /// The ranks of the group (--tp): a follower started for another world is refused at the hello.
+    world: u64 = 2,
 };
 
 fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
@@ -32,8 +37,8 @@ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
     return out;
 }
 
-/// The checkpoint's bytes as both ranks see them: TENSORFOLD_CHECKPOINT_SHA256 when set, else the cached full digest.
-pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize, chunk: usize) !Identity {
+/// The checkpoint's bytes as every rank sees them: TENSORFOLD_CHECKPOINT_SHA256 when set, else the cached full digest.
+pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize, chunk: usize, world: usize) !Identity {
     var checkpoint: [32]u8 = undefined;
     if (std.c.getenv("TENSORFOLD_CHECKPOINT_SHA256")) |given| {
         const digest = std.mem.span(given);
@@ -46,7 +51,7 @@ pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usiz
     defer a.free(index);
     const program = try std.process.executablePathAlloc(io, a);
     defer a.free(program);
-    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, 2)) };
+    return .{ .config = try fileHash(a, io, config), .index = try fileHash(a, io, index), .program = try fileHash(a, io, program), .checkpoint = checkpoint, .context = context, .chunk = chunk, .decode_graph = @intFromBool(@import("cuda_round_graph.zig").enabled()), .head_sharded = @intFromBool(try @import("cuda_head.zig").enabled()), .dense_split = @intFromBool(try @import("cuda_dense_split.zig").appliesDir(a, io, dir, world)), .world = world };
 }
 
 /// How long a rank waits for its peer: a minute with a given digest, 30 when the peer may be hashing every byte.
@@ -57,7 +62,9 @@ pub fn linkWait() u64 {
 pub const Session = struct {
     gpa: std.mem.Allocator,
     rank: usize,
+    world: usize = 2,
     benchmark_group: ?[]const u8 = null,
+    /// The leader's links to every follower in rank order, or a follower's link to the leader.
     link: wire.Link,
     collective: Collective,
     engine: *prompt.Engine = undefined,
@@ -72,30 +79,48 @@ pub const Session = struct {
 
     /// `wait_ms` bounds the link and the hello: the peer may still be reading every byte for its digest (`linkWait`).
     pub fn init(a: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, rank: usize, mine: Identity, wait_ms: u64) !*Session {
-        if (rank > 1) return error.BadRank;
+        const world: usize = std.math.cast(usize, mine.world) orelse return error.BadRank;
+        if (world < 2 or world > wire.max_ranks or rank >= world) return error.BadRank;
         const s = try a.create(Session);
         errdefer a.destroy(s);
-        if (wait_ms > 60_000) std.log.info("flashnext: rank {d} waits up to {d} min for rank {d} and its checkpoint digest", .{ rank, wait_ms / 60_000, 1 - rank });
-        const link = try wire.Link.open(io, host, port, rank, wait_ms);
+        if (wait_ms > 60_000) {
+            if (rank == 0) {
+                std.log.info("flashnext: rank 0 waits up to {d} min for {d} more rank(s) and their checkpoint digests", .{ wait_ms / 60_000, world - 1 });
+            } else std.log.info("flashnext: rank {d} waits up to {d} min for rank 0 and its checkpoint digest", .{ rank, wait_ms / 60_000 });
+        }
+        var link = try wire.Link.open(io, host, port, rank, world, wait_ms);
         errdefer link.close();
         const until = wire.deadline(wait_ms);
-        var peer: Identity = undefined;
         const hello: wire.Header = .{ .kind = .hello, .arg = rank, .bytes = @sizeOf(Identity) };
         if (rank == 0) {
             try link.sendHeader(hello, until);
             try link.send(std.mem.asBytes(&mine), until);
-            const h = try link.receiveHeader(until);
-            if (h.kind != .hello or h.sequence != 0 or h.arg != 1 or h.bytes != @sizeOf(Identity) or h.flags != 0 or h.object != 0) return error.RankIdentity;
-            try link.receive(std.mem.asBytes(&peer), until);
+            // followers connect in any order: each hello names its rank, once
+            var order: [wire.max_ranks - 1]usize = undefined;
+            var seen: [wire.max_ranks]bool = @splat(false);
+            for (0..link.peers()) |i| {
+                const one = link.peer(i);
+                const h = try one.receiveHeader(until);
+                try helloShape(h);
+                if (h.arg == 0 or h.arg >= world or seen[@intCast(h.arg)]) return error.RankIdentity;
+                seen[@intCast(h.arg)] = true;
+                order[@intCast(h.arg - 1)] = i;
+                var peer: Identity = undefined;
+                try one.receive(std.mem.asBytes(&peer), until);
+                if (!sameIdentity(mine, peer)) return error.RankIdentity;
+            }
+            link = link.ordered(order[0..link.peers()]);
         } else {
             const h = try link.receiveHeader(until);
-            if (h.kind != .hello or h.sequence != 0 or h.arg != 0 or h.bytes != @sizeOf(Identity) or h.flags != 0 or h.object != 0) return error.RankIdentity;
+            try helloShape(h);
+            if (h.arg != 0) return error.RankIdentity;
+            var peer: Identity = undefined;
             try link.receive(std.mem.asBytes(&peer), until);
             try link.sendHeader(hello, until);
             try link.send(std.mem.asBytes(&mine), until);
+            if (!sameIdentity(mine, peer)) return error.RankIdentity;
         }
-        if (!sameIdentity(mine, peer)) return error.RankIdentity;
-        s.* = .{ .gpa = a, .rank = rank, .link = link, .collective = try Collective.init(link, rank, 30_000), .drafting = mine.mtp == 1 };
+        s.* = .{ .gpa = a, .rank = rank, .world = world, .link = link, .collective = try Collective.init(link, rank, world, 30_000), .drafting = mine.mtp == 1 };
         return s;
     }
 
@@ -109,7 +134,7 @@ pub const Session = struct {
         s.stopped = true;
         s.available.store(false, .release);
         s.collective.abort();
-        _ = std.c.shutdown(s.link.fd, std.posix.SHUT.RDWR);
+        s.link.shutdown();
     }
 
     pub fn deinit(s: *Session) void {
@@ -140,16 +165,23 @@ pub const Session = struct {
         const until = wire.deadline(600_000);
         errdefer s.poison();
         const mine: wire.Header = .{ .kind = .ready, .arg = local };
-        const peer = if (s.rank == 0) peer: {
+        var least = local;
+        if (s.rank == 0) {
+            // every follower's room first, then the least of all back to each: all ranks budget the same number
+            for (0..s.link.peers()) |i| {
+                const h = try s.link.peer(i).receiveHeader(until);
+                try readyShape(h);
+                least = @min(least, h.arg);
+            }
+            try s.link.sendHeader(.{ .kind = .ready, .arg = least }, until);
+        } else {
             try s.link.sendHeader(mine, until);
-            break :peer try s.link.receiveHeader(until);
-        } else peer: {
             const h = try s.link.receiveHeader(until);
-            try s.link.sendHeader(mine, until);
-            break :peer h;
-        };
-        if (peer.kind != .ready or peer.sequence != 0 or peer.object != 0 or peer.bytes != 0 or peer.flags != 0) return error.BadRankFrame;
-        return @min(local, peer.arg);
+            try readyShape(h);
+            if (h.arg > local) return error.BadRankFrame;
+            least = h.arg;
+        }
+        return least;
     }
 
     pub fn command(s: *Session, input: wire.Header, payload: []const u8) !wire.Header {
@@ -165,12 +197,18 @@ pub const Session = struct {
         return h;
     }
 
+    /// Every follower's answer to `sent`, in rank order; the first refusal is the error, after all have been read.
     pub fn ack(s: *Session, sent: wire.Header) !void {
         errdefer s.poison();
-        const h = try s.link.receiveHeader(wire.deadline(30_000));
-        if (h.kind != .ack or h.sequence != sent.sequence or h.object != sent.object or h.bytes != 0 or h.arg != 0) return error.BadRankFrame;
-        if (h.flags == 1) return error.OutOfDeviceMemory;
-        if (h.flags != 0) return error.RemoteRank;
+        const until = wire.deadline(30_000);
+        var flags: u32 = 0;
+        for (0..s.link.peers()) |i| {
+            const h = try s.link.peer(i).receiveHeader(until);
+            if (h.kind != .ack or h.sequence != sent.sequence or h.object != sent.object or h.bytes != 0 or h.arg != 0) return error.BadRankFrame;
+            if (flags == 0) flags = h.flags;
+        }
+        if (flags == 1) return error.OutOfDeviceMemory;
+        if (flags != 0) return error.RemoteRank;
     }
 
     pub fn create(s: *Session, cap: usize) !prompt.Seq {
@@ -291,7 +329,7 @@ pub const Session = struct {
     }
 
     pub fn follow(s: *Session, comptime Tri: type, tri: Tri, logits: u64) !void {
-        if (s.rank != 1) return error.BadRank;
+        if (s.rank == 0) return error.BadRank;
         errdefer s.poison();
         const payload = try s.gpa.alloc(u8, wire.max_payload);
         defer s.gpa.free(payload);
@@ -423,6 +461,14 @@ fn roundPayload(payload: []const u8) !void {
     }
 }
 
+fn helloShape(h: wire.Header) !void {
+    if (h.kind != .hello or h.sequence != 0 or h.bytes != @sizeOf(Identity) or h.flags != 0 or h.object != 0) return error.RankIdentity;
+}
+
+fn readyShape(h: wire.Header) !void {
+    if (h.kind != .ready or h.sequence != 0 or h.object != 0 or h.bytes != 0 or h.flags != 0) return error.BadRankFrame;
+}
+
 fn sameIdentity(a: Identity, b: Identity) bool {
     return std.mem.eql(u8, std.mem.asBytes(&a), std.mem.asBytes(&b));
 }
@@ -466,6 +512,9 @@ test "rank identity binds checkpoint, config, index, program and execution setti
     try std.testing.expect(!sameIdentity(base, other));
     other = base;
     other.head_sharded = 1;
+    try std.testing.expect(!sameIdentity(base, other));
+    other = base;
+    other.world = 4;
     try std.testing.expect(!sameIdentity(base, other));
 }
 
@@ -543,12 +592,12 @@ test "rank identity: the cached full digest by default, a given digest when set,
     defer t.allocator.free(dir);
     _ = env.unsetenv("TENSORFOLD_CHECKPOINT_SHA256");
     try t.expectEqual(@as(u64, 30 * 60_000), linkWait());
-    const computed = try identity(t.allocator, t.io, dir, 4096, 64);
+    const computed = try identity(t.allocator, t.io, dir, 4096, 64, 2);
     try t.expectEqual(try @import("core").checkpoint_identity.fullIdentity(t.allocator, t.io, dir), computed.checkpoint);
     _ = env.setenv("TENSORFOLD_CHECKPOINT_SHA256", "abababababababababababababababababababababababababababababababab", 1);
     defer _ = env.unsetenv("TENSORFOLD_CHECKPOINT_SHA256");
     try t.expectEqual(@as(u64, 60_000), linkWait());
-    try t.expectEqual(@as([32]u8, @splat(0xab)), (try identity(t.allocator, t.io, dir, 4096, 64)).checkpoint);
+    try t.expectEqual(@as([32]u8, @splat(0xab)), (try identity(t.allocator, t.io, dir, 4096, 64, 2)).checkpoint);
     _ = env.setenv("TENSORFOLD_CHECKPOINT_SHA256", "ab", 1);
-    try t.expectError(error.NoCheckpointIdentity, identity(t.allocator, t.io, dir, 4096, 64));
+    try t.expectError(error.NoCheckpointIdentity, identity(t.allocator, t.io, dir, 4096, 64, 2));
 }

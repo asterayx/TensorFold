@@ -17,7 +17,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
 
     if (o.context > prompt.max_tokens) return error.ContextOverWindow;
     if (o.segments != 1) return error.UnsupportedOption;
-    if (o.tp != 1 and o.tp != 2) return error.FlashNextRanksOverTwo;
+    if (o.tp == 0 or o.tp > ranks.max_ranks) return error.FlashNextRanksOverTwo;
     if (o.rank >= o.tp) return error.BadRank;
     // refused before the stream, the glue or a captured set loads: the largest pass, wider at --parallel 1 on one rank
     const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows(), o.one_stream and o.tp == 1);
@@ -49,8 +49,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     // a captured set replaces our glue, for comparison, when it holds every entry point this engine launches
     if (captured) |kernels| own.set = try F.comparison(gpa, io, driver, ctx, kernels, o.drafts);
     errdefer if (own.set) |*x| x.deinit();
-    if (o.tp == 2) {
-        var id = try ranks.identity(gpa, io, dir, o.context, chunk);
+    if (o.tp > 1) {
+        var id = try ranks.identity(gpa, io, dir, o.context, chunk, o.tp);
         id.mtp = @intFromBool(o.drafts);
         if (o.vision) |v| {
             try @import("qwen_vision").media.checkLimits(v);
@@ -105,7 +105,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     var stream_bytes = own_seq_bytes;
     if (own.head) |h| {
         stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
-    } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
+    } else if (o.drafts and o.tp > 1) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
     if (page_tokens > 0) {
         // the lane's head runs at the engine's chunk: its cache on the stream's pages, its buffers in the run

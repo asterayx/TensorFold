@@ -138,7 +138,7 @@ pub const Engine = struct {
     }
     pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
-        if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+        if (world == 0 or world > @import("cuda_rank_wire.zig").max_ranks or rank >= world) return error.BadRank;
         // refused before anything loads: a bad TF_FLASHNEXT_CHUNK leaves no module or buffer behind
         const busy = try chunkRows();
         const chunk = try chunks.soloRows(busy, false);
