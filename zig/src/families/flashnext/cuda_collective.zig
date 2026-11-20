@@ -23,6 +23,8 @@ fn spinSetting() !u64 {
     return spinNs(if (std.c.getenv("TF_FLASHNEXT_COLLECTIVE_SPIN_US")) |v| std.mem.span(v) else null);
 }
 
+const Box = @import("cuda_box.zig").Box;
+
 pub const Collective = struct {
     lib: nccl.Library,
     api: Advanced,
@@ -34,6 +36,8 @@ pub const Collective = struct {
     failed: bool = false,
     /// How long a wait polls without sleeping before it falls back to `wire.pause` (TF_FLASHNEXT_COLLECTIVE_SPIN_US).
     spin_ns: u64 = 0,
+    /// The ranks' small gathers and sums as one kernel a rank, when every rank set it up (cuda_box.zig).
+    box: ?Box = null,
 
     /// `link` has completed the source/settings handshake; it stays owned by the caller.
     pub fn init(link: wire.Link, rank: usize, world: usize, timeout_ms: u64) !Collective {
@@ -59,8 +63,16 @@ pub const Collective = struct {
         return c;
     }
 
+    /// The kernel path for small collectives, if TF_FLASHNEXT_COLLECTIVE_BOX asks for it and every rank can: every
+    /// rank calls this at the same point, after `init` and before any command.
+    pub fn openBox(c: *Collective, d: *const cuda.Driver) !void {
+        errdefer c.abort();
+        c.box = try Box.open(d, c.link, c.rank, c.world, c.timeout_ms);
+    }
+
     pub fn abort(c: *Collective) void {
         c.failed = true;
+        if (c.box) |*b| b.abort();
         if (c.comm) |comm| {
             _ = c.api.ncclCommAbort(comm);
             c.comm = null;
@@ -70,6 +82,8 @@ pub const Collective = struct {
     pub fn deinit(c: *Collective) void {
         // Abort is local and also releases an idle communicator if its peer exited first.
         c.abort();
+        if (c.box) |*b| b.close();
+        c.box = null;
         c.lib.close();
     }
 
@@ -109,6 +123,11 @@ pub const Collective = struct {
     pub fn finish(c: *Collective, stream: cuda.Stream) !void {
         if (c.failed or c.comm == null) return error.RankDisconnected;
         try c.wait(stream, wire.deadline(c.timeout_ms));
+        // the stream is idle: an exchange of the kernel path that failed on any rank has left its record
+        if (c.box) |*b| b.check() catch |e| {
+            c.abort();
+            return e;
+        };
     }
 
     pub fn benchmarkShape(c: *Collective) !nccl.Shape {
@@ -147,6 +166,10 @@ pub const Collective = struct {
         if (c.failed or c.comm == null) return error.RankDisconnected;
         if (count == 0) return;
         errdefer c.abort();
+        if (c.box) |*b| {
+            const bytes = count * @as(usize, if (dtype == .f32) 4 else 2);
+            if (b.takes(bytes)) return b.run(.gather, stream, local, out, bytes);
+        }
         try c.link.checkPeer();
         try c.submitted(c.lib.api.ncclAllGather(local, out, count, dtype, c.comm, stream.handle));
         try c.wait(null, wire.deadline(c.timeout_ms));
@@ -165,6 +188,9 @@ pub const Collective = struct {
         if (c.failed or c.comm == null) return error.RankDisconnected;
         if (count == 0) return;
         errdefer c.abort();
+        // the kernel adds in rank order where NCCL adds in its ring's: the same bits at two ranks, and at more
+        // wherever each value is another than +0 on one rank alone, which is every sum this engine makes
+        if (c.box) |*b| if (b.takes(count * 4)) return b.run(.sum_f32, stream, values, values, count * 4);
         try c.link.checkPeer();
         try c.submitted(c.lib.api.ncclAllReduce(values, values, count, .f32, .sum, c.comm, stream.handle));
         try c.wait(null, wire.deadline(c.timeout_ms));
@@ -180,6 +206,10 @@ pub const Collective = struct {
         try c.wait(null, wire.deadline(c.timeout_ms));
     }
 };
+
+test {
+    _ = @import("cuda_box.zig");
+}
 
 test "the collective spin setting: microseconds up to 10 ms, none when unset" {
     try std.testing.expectEqual(@as(u64, 0), try spinNs(null));
