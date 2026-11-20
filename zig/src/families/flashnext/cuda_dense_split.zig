@@ -34,9 +34,15 @@ pub fn enabled() !bool {
     return setting(if (std.c.getenv("TF_FLASHNEXT_SPLIT_DENSE")) |v| std.mem.span(v) else null);
 }
 
-/// At two ranks with the setting on, a checkpoint whose deciders are BF16 splits; world 1 never reads the setting.
+/// The worlds whose ranks can share a layer's heads evenly: two (half each) and four (a quarter each).
+pub fn splits(world: usize) bool {
+    return world > 1 and if (Heads.split(world)) |_| true else |_| false;
+}
+
+/// At two or four ranks with the setting on, a checkpoint whose deciders are BF16 splits; world 1 never reads the
+/// setting, and any other world keeps every dense layer whole on every rank.
 pub fn applies(store: anytype, world: usize) !bool {
-    if (world != 2 or !try enabled()) return false;
+    if (!splits(world) or !try enabled()) return false;
     for (deciders) |name| if (!store.has(name)) return false;
     for (deciders) |name| if ((try store.tensor(name)).dtype != .bf16) return false;
     return true;
@@ -44,11 +50,11 @@ pub fn applies(store: anytype, world: usize) !bool {
 
 /// The heads a rank computes of every model layer: half of each under the split, else the whole layer.
 pub fn heads(store: anytype, world: usize) !Heads {
-    return if (try applies(store, world)) .half else .full;
+    return if (try applies(store, world)) try Heads.split(world) else .full;
 }
 
 pub fn appliesDir(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize) !bool {
-    if (world != 2) return false;
+    if (!splits(world)) return false;
     var store = try wt.Store.open(gpa, io, dir);
     defer store.deinit();
     return applies(&store, world);

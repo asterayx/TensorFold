@@ -256,6 +256,29 @@ test "each rank's ranges are the design's: q, k, v, z, b, a, the attention heads
     try std.testing.expectError(error.UnevenHeadSplit, heads_cut.valueHeads(.{ .nk = 8, .nv = 0x80000018, .q = 12, .kv = 1 }, 0));
 }
 
+test "four ranks' ranges: a quarter of q, k, v, z, b, a and of the queries each, and a KV head to each pair of ranks" {
+    for (0..4) |r| {
+        const d = try heads_cut.delta(.quarter, r);
+        const qkv = [_][2]usize{ .{ 512 * r, 512 * r + 512 }, .{ 2048 + 512 * r, 2560 + 512 * r }, .{ 4096 + 1536 * r, 5632 + 1536 * r } };
+        try expectRanges(&qkv, d.ranges[0]);
+        try expectRanges(&.{.{ 1536 * r, 1536 * r + 1536 }}, d.ranges[1]);
+        for (d.ranges[2..]) |kept| try expectRanges(&.{.{ 12 * r, 12 * r + 12 }}, kept);
+        try std.testing.expectEqual(@as(usize, 4120), d.n);
+        const t = try heads_cut.attention(.quarter, r);
+        // 6 query heads: each head's q and gate rows
+        try expectRanges(&.{.{ 3072 * r, 3072 * r + 3072 }}, t.ranges[0]);
+        // ranks 0 and 1 read the first KV head, ranks 2 and 3 the second: the one their queries belong to
+        const kv = (r / 2) * 256;
+        for (t.ranges[1..3]) |kept| try expectRanges(&.{.{ kv, kv + 256 }}, kept);
+        try expectRanges(&.{.{ 0, 640 }}, t.ranges[3]);
+        try std.testing.expectEqual(@as(usize, 4224), t.n);
+    }
+    try std.testing.expectError(error.UnevenHeadSplit, heads_cut.attention(.quarter, 4));
+    // more KV heads on a rank than its share, when it is not the one head its queries read, is refused
+    try std.testing.expectError(error.UnevenHeadSplit, heads_cut.attention(.{ .nk = 8, .nv = 24, .q = 12, .kv = 2 }, 0));
+    try std.testing.expectError(error.UnevenHeadSplit, heads_cut.attention(.{ .nk = 4, .nv = 12, .q = 6, .kv = 2 }, 0));
+}
+
 test "a cut projection pins the whole stitched shape's K slices, so each kept row plans as the whole one does" {
     for ([_]bool{ true, false }) |linear| {
         const whole_n: usize = if (linear) 16480 else 13952;

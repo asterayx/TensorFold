@@ -145,6 +145,14 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_front_h8(
     gdn_front<8, 24, false>(P, cs, cw, a_log, dt_bias, qn, kn, v, gb, nullptr, 1);
 }
 
+// fn_gdn_front on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(256) fn_gdn_front_h4(
+        const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ qn,
+        float* __restrict__ kn, float* __restrict__ v, float* __restrict__ gb) {
+    gdn_front<4, 12, false>(P, cs, cw, a_log, dt_bias, qn, kn, v, gb, nullptr, 1);
+}
+
 // The chain through the chunk from state_in to state_out (in place, or apart for a rollback): a warp 4 state rows.
 template <int NK, int NV>
 static __device__ __forceinline__ void gdn_rows(
@@ -329,10 +337,24 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_h8(
     gdn_rows<8, 24>(qn, kn, v, gb, state, state, rows, ys_out);
 }
 
+// fn_gdn_rows on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_h4(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, float* state, int rows, float* __restrict__ ys_out) {
+    gdn_rows<4, 12>(qn, kn, v, gb, state, state, rows, ys_out);
+}
+
 extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_to_h8(
         const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
         const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
     gdn_rows<8, 24>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+}
+
+// fn_gdn_rows_to on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_to_h4(
+        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out) {
+    gdn_rows<4, 12>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
 }
 
 template <int NK, int NV>
@@ -376,6 +398,13 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm_h8(
         const float* __restrict__ ys_in, const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ norm_w,
         float eps, __nv_bfloat16* __restrict__ out, float* __restrict__ xs) {
     gdn_norm<8, 24>(ys_in, P, norm_w, eps, out, xs);
+}
+
+// fn_gdn_norm on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm_h4(
+        const float* __restrict__ ys_in, const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ norm_w,
+        float eps, __nv_bfloat16* __restrict__ out, float* __restrict__ xs) {
+    gdn_norm<4, 12>(ys_in, P, norm_w, eps, out, xs);
 }
 
 // ---- sparse attention (QSA): each row's blocks ----------------------------------------------------------------------

@@ -123,6 +123,7 @@ const Rig = struct {
         if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &r.pair) != 0) return error.SocketPair;
         r.c = undefined;
         r.c.rank = 0;
+        r.c.world = 2;
         r.c.failed = false;
         r.c.comm = @ptrFromInt(0x1000);
         r.c.link = .{ .fd = r.pair[0] };
@@ -150,13 +151,18 @@ const Rig = struct {
     }
 
     fn layer(r: *Rig, k: usize, native: bool, cut: ?Cut) Layer {
+        return r.layerOf(k, native, cut, 2);
+    }
+
+    /// A layer cut between `world` ranks when `cut` names this rank's output columns, else whole.
+    fn layerOf(r: *Rig, k: usize, native: bool, cut: ?Cut, world: usize) Layer {
         const z: cuda.DeviceBuffer = .{ .d = &r.d, .ptr = 0, .len = 0 };
         var lw: Layer = undefined;
-        lw.heads = if (cut != null) .half else .full;
+        lw.heads = if (cut != null) (@import("cuda_heads.zig").Heads.split(world) catch unreachable) else .full;
         lw.out = .{ .w = z, .s = z, .b = z, .n = dims, .k = k, .native = if (native) cuda.modelopt.bf16Weight(0x2000, dims, k) else null };
         if (cut != null) {
-            lw.out.n = dims / 2;
-            if (native) lw.out.native = tryPin(cuda.modelopt.bf16Weight(0x2000, dims / 2, k));
+            lw.out.n = dims / world;
+            if (native) lw.out.native = tryPin(cuda.modelopt.bf16Weight(0x2000, dims / world, k));
         }
         lw.dense_cut = cut;
         return lw;
@@ -205,6 +211,54 @@ test "split out lane gathers full BF16 inputs and disjoint FP32 outputs without 
         for (calls) |c| try std.testing.expect(c.kind != .sum and c.kind != .memset);
         if (one) for (calls) |c| try std.testing.expect(c.f != copy_id);
     };
+}
+
+test "split out lane at four ranks: a quarter of the head outputs from each rank, a quarter of the output columns on each" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.init();
+    defer r.deinit();
+    r.c.world = 4;
+    const width = out_k / 4; // 1,536 bf16 of head outputs a rank
+    const cols = dims / 4; // 640 fp32 output columns a rank
+    for ([_]usize{ 1, 4, 33, 256 }) |n| for (0..4) |rank| {
+        r.c.rank = rank;
+        const cut = try Cut.init(dims, 4, rank);
+        const lw = r.layerOf(out_k, true, cut, 4);
+        var p = r.pass(n, true);
+        Rec.n = 0;
+        try std.testing.expectEqual(@as(usize, 1), try split_lane.out(&p, x_at, 0x20, &lw));
+        const calls = recorded();
+        const one = n == 1;
+        const copies: usize = if (one) 0 else 8;
+        try std.testing.expect(calls.len == 3 + copies or calls.len == 4 + copies);
+        try std.testing.expectEqual(Call{ .kind = .gather, .a = .{ x_at, @intCast(r.s.rank_gather), @intCast(n * width), @backingInt(nccl.DataType.bf16), 0, 0 } }, calls[0]);
+        if (!one) for (0..4) |peer| {
+            const c = calls[1 + peer];
+            try std.testing.expectEqual(copy_id, c.f);
+            try std.testing.expectEqualSlices(i64, &.{ @intCast(r.s.rank_gather + peer * n * width * 2), width, @intCast(r.s.rank_input + peer * width * 2), out_k, width, 0 }, &c.a);
+        };
+        const q = calls[1 + copies / 2];
+        try std.testing.expectEqual(qmmf_id, q.f);
+        try std.testing.expectEqual(@as(i64, @intCast(if (one) r.s.rank_gather else r.s.rank_input)), q.a[0]);
+        try std.testing.expectEqual(@as(i64, 640 * 1_000_000 + 6144), q.a[4]);
+        try std.testing.expectEqual(@as(i64, out_k), q.a[5]);
+        const at = calls.len - 1 - copies / 2;
+        try std.testing.expectEqual(Call{ .kind = .gather, .a = .{ @intCast(r.s.rank_output), @intCast(if (one) part_at else r.s.rank_result), @intCast(n * cols), @backingInt(nccl.DataType.f32), 0, 0 } }, calls[at]);
+        if (!one) for (0..4) |peer| {
+            const c = calls[at + 1 + peer];
+            try std.testing.expectEqual(copy_id, c.f);
+            try std.testing.expectEqualSlices(i64, &.{ @intCast(r.s.rank_result + peer * n * cols * 4), cols * 2, @intCast(part_at + peer * cols * 4), dims * 2, cols * 2, 0 }, &c.a);
+        };
+        for (calls) |c| try std.testing.expect(c.kind != .sum and c.kind != .memset);
+    };
+    // a layer cut for two ranks in a group of four is refused, as is a rank's columns in another rank's place
+    r.c.rank = 1;
+    const two = r.layerOf(out_k, true, try Cut.init(dims, 2, 1), 2);
+    var p = r.pass(4, true);
+    try std.testing.expectError(error.UnexpectedTensor, split_lane.out(&p, x_at, 0x20, &two));
+    const wrong = r.layerOf(out_k, true, try Cut.init(dims, 4, 2), 4);
+    try std.testing.expectError(error.UnexpectedTensor, split_lane.out(&p, x_at, 0x20, &wrong));
 }
 
 test "split out lane: an unsplit layer launches exactly what Pass.lane launches, with or without a collective" {
@@ -277,13 +331,15 @@ test "shared expert composition keeps whole direct slots and split full-K output
     };
     // the lane's 128-row tile loaded (from qmmf.prompt_rows rows): the whole down still goes direct at 512 rows
     r.k.native_lane.prompt = @splat(@splat(cuda.Function{ .d = &r.d, .handle = @ptrFromInt(prompt_id) }));
-    for ([_]bool{ false, true }) |split| for ([_]usize{ 1, 64, 512 }) |n| for (0..2) |rank| {
+    for ([_]usize{ 2, 4 }) |w| for ([_]bool{ false, true }) |split| for ([_]usize{ 1, 64, 512 }) |n| for (0..w) |rank| {
+        r.c.world = w;
         r.c.rank = rank;
         var native: @import("cuda_mixed_experts.zig").Owned = undefined;
         native.rank = rank;
         native.split_shared = split;
-        const width: usize = if (split) wt.moe_w / 2 else wt.moe_w;
-        const columns: usize = if (split) dims / 2 else dims;
+        native.world = w;
+        const width: usize = if (split) wt.moe_w / w else wt.moe_w;
+        const columns: usize = if (split) dims / w else dims;
         for (0..3) |i| native.shared[i].native = cuda.modelopt.bf16Weight(0x2000, if (i == 2) columns else width, if (i == 2) wt.moe_w else dims);
         var self: Self = .{ .k = &r.k, .s = &r.s, .m = r.pass(n, true).m, .stream = .{ .d = &r.d, .handle = null }, .tri = .{ .own = &glue } };
         Rec.n = 0;
@@ -306,7 +362,7 @@ test "shared expert composition keeps whole direct slots and split full-K output
             try std.testing.expectEqual(@as(i64, wt.moe_w), down.a[5]);
             if (split) {
                 try std.testing.expectEqual(copy_id, last.f);
-                try std.testing.expectEqualSlices(i64, &.{ @intCast(r.s.shared_out), dims, @intCast(r.s.y + (wt.slots - 1) * dims * 4 + rank * dims * 2), wt.slots * dims * 2, dims, 0 }, &last.a);
+                try std.testing.expectEqualSlices(i64, &.{ @intCast(r.s.shared_out), @intCast(columns * 2), @intCast(r.s.y + (wt.slots - 1) * dims * 4 + rank * columns * 4), wt.slots * dims * 2, @intCast(columns * 2), 0 }, &last.a);
                 var gather_at: ?usize = null;
                 for (recorded(), 0..) |call, i| if (call.kind == .gather) {
                     try std.testing.expect(gather_at == null);
@@ -315,9 +371,9 @@ test "shared expert composition keeps whole direct slots and split full-K output
                 const at = gather_at orelse return error.TestExpectedGather;
                 // one row: the gathered rows are the down projection's input as they land, no copy
                 const one = n == 1;
-                try std.testing.expectEqual(at + @as(usize, if (one) 3 else 5), Rec.n);
+                try std.testing.expectEqual(at + @as(usize, if (one) 3 else 3 + w), Rec.n);
                 try std.testing.expectEqual(Call{ .kind = .gather, .a = .{ @intCast(r.s.shared_act), @intCast(r.s.rank_gather), @intCast(n * width), @backingInt(nccl.DataType.bf16), 0, 0 } }, recorded()[at]);
-                if (!one) for (0..2) |peer| {
+                if (!one) for (0..w) |peer| {
                     const copy = recorded()[at + 1 + peer];
                     try std.testing.expectEqual(copy_id, copy.f);
                     try std.testing.expectEqualSlices(i64, &.{ @intCast(r.s.rank_gather + peer * n * width * 2), @intCast(width), @intCast(r.s.rank_input + peer * width * 2), wt.moe_w, @intCast(width), 0 }, &copy.a);
@@ -334,6 +390,7 @@ test "shared expert composition keeps whole direct slots and split full-K output
     var native: @import("cuda_mixed_experts.zig").Owned = undefined;
     native.rank = 0;
     native.split_shared = false;
+    native.world = 2;
     for (0..3) |i| native.shared[i].native = cuda.modelopt.bf16Weight(0x2000, if (i == 2) dims else wt.moe_w, if (i == 2) wt.moe_w else dims);
     native.shared[2].native.?.npad += 1;
     var self: Self = .{ .k = &r.k, .s = &r.s, .m = r.pass(64, true).m, .stream = .{ .d = &r.d, .handle = null }, .tri = .{ .own = &glue } };

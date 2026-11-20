@@ -22,7 +22,10 @@ fn check(h: Heads, rank: usize) error{UnevenHeadSplit}!void {
     const f = Heads.full;
     if (h.nk == 0 or f.nk % h.nk != 0) return error.UnevenHeadSplit;
     const w: usize = f.nk / h.nk;
-    if (f.nv != w * h.nv or f.q != w * h.q or f.kv != w * h.kv or rank >= w) return error.UnevenHeadSplit;
+    if (f.nv != w * h.nv or f.q != w * h.q or rank >= w) return error.UnevenHeadSplit;
+    // a rank's KV heads: its share, or when the ranks outnumber the KV heads the one all its queries read
+    const per_kv = f.q / f.kv;
+    if (f.kv != w * h.kv and !(h.kv == 1 and per_kv % h.q == 0)) return error.UnevenHeadSplit;
 }
 
 fn span(from: usize, width: usize) Cut {
@@ -65,8 +68,8 @@ pub fn attention(h: Heads, rank: usize) !Stitch {
     const s: Stitch = .{
         .ranges = .{
             Ranges.of(&.{span(rank * q, q)}),
-            Ranges.of(&.{span(rank * kv, kv)}),
-            Ranges.of(&.{span(rank * kv, kv)}),
+            Ranges.of(&.{span(h.kvFirst(rank) * wt.head_dim, kv)}),
+            Ranges.of(&.{span(h.kvFirst(rank) * wt.head_dim, kv)}),
             Ranges.of(&.{span(0, wt.index_heads * wt.index_dim + wt.index_dim)}),
         },
         .n = h.projN(),
