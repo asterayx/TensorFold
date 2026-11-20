@@ -88,6 +88,7 @@ fn collective(pair: *[2]c_int, rank: usize, world: usize, timeout_ms: u64) !Coll
     c.rank = rank;
     c.world = world;
     c.spin_ns = 0;
+    c.box = null;
     c.lib.api.ncclAllReduce = Fake.reduce;
     c.lib.api.ncclAllGather = Fake.gather;
     c.api.ncclReduceScatter = Fake.scatter;
@@ -238,4 +239,77 @@ test "a wait sleeps between looks unless told to spin first, and meets its deadl
     // 20 ms of 50 us sleeps is 400 looks at most; half of it spent polling is many times that
     try expect(sleeping >= 1 and sleeping <= 400);
     try expect(spinning > 4 * sleeping);
+}
+
+const Box = @import("cuda_box.zig").Box;
+const BoxArgs = @import("cuda_box.zig").Args;
+
+/// What cuLaunchKernel was handed for the box's kernel: its one by-value argument.
+const BoxFake = struct {
+    var args: [8]BoxArgs = undefined;
+    var grids: [8]c_uint = undefined;
+    var len: usize = 0;
+
+    fn launch(_: abi.Function, gx: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, raw: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+        std.debug.assert(bx == 256);
+        args[len] = @as(*const BoxArgs, @ptrCast(@alignCast(raw.?[0].?))).*;
+        grids[len] = gx;
+        len += 1;
+        return 0;
+    }
+};
+
+/// A box of `world` ranks over a plain page (nothing is mapped to a device; the kernel is the fake's).
+fn fakeBox(d: *const cuda.Driver, region: []align(std.heap.page_size_min) u8, rank: u32, world: u32) Box {
+    return .{ .d = d, .region = region, .dev = 0x9000_0000, .module = undefined, .func = .{ .d = d, .handle = @ptrFromInt(2) }, .rank = rank, .world = world, .slot_bytes = 262144, .limit = 262144, .timeout_ns = 1_000_000 };
+}
+
+test "the box takes a decode row's sum and a small gather as one launch each, numbered in order, and leaves the rest to NCCL" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = BoxFake.launch;
+    const page = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 4096);
+    defer std.testing.allocator.free(page);
+    @memset(page, 0);
+    var pair: [2]c_int = .{ -1, -1 };
+    var c = try collective(&pair, 1, 4, 1000);
+    defer close(pair);
+    c.box = fakeBox(&d, page, 1, 4);
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    Fake.reset();
+    BoxFake.len = 0;
+    // one decode row: 11 slots of 2560 fp32, in place
+    try c.sum(stream, 0x1000_0000, 11 * 2560);
+    // a split layer's head outputs: 6144 bf16 a rank, this rank's part already in its place of the gathered buffer
+    try c.gather(stream, 0x2000_0000 + 1 * 6144 * 2, 0x2000_0000, 6144);
+    try c.gatherF32(stream, 0x3000_0000 + 1 * 640 * 4, 0x3000_0000, 640);
+    try expectEqual(@as(usize, 3), BoxFake.len);
+    try expectEqual(@as(usize, 0), Fake.len); // no NCCL call
+    try expectEqual(BoxArgs{ .in = 0x1000_0000, .out = 0x1000_0000, .region = 0x9000_0000, .nbytes = 112640, .slot_bytes = 262144, .timeout_ns = 1_000_000, .rank = 1, .world = 4, .mode = 1, .seq = 1 }, BoxFake.args[0]);
+    try expectEqual(@as(c_uint, 7), BoxFake.grids[0]);
+    try expectEqual(BoxArgs{ .in = 0x2000_3000, .out = 0x2000_0000, .region = 0x9000_0000, .nbytes = 12288, .slot_bytes = 262144, .timeout_ns = 1_000_000, .rank = 1, .world = 4, .mode = 0, .seq = 2 }, BoxFake.args[1]);
+    try expectEqual(@as(c_uint, 1), BoxFake.grids[1]);
+    try expect(BoxFake.args[2].nbytes == 2560 and BoxFake.args[2].mode == 0 and BoxFake.args[2].seq == 3);
+    // past the limit, and the reduce-scatter at any size: NCCL
+    try c.sum(stream, 0x1000_0000, 262144 / 4 + 4);
+    try c.sumBlock(stream, 0x1000_0000, 2560);
+    try expectEqual(@as(usize, 3), BoxFake.len);
+    try expect(Fake.len == 2 and Fake.calls[0].kind == .reduce and Fake.calls[1].kind == .scatter);
+    // a size that is not whole 16-byte packs is NCCL's on every rank alike
+    try c.gather(stream, 0x2000_0000, 0x2000_0000, 6145);
+    try expect(BoxFake.len == 3 and Fake.len == 3 and Fake.calls[2].kind == .gather);
+    // an address that is not 16-byte aligned is this rank's error, not a quiet change of path
+    try std.testing.expectError(error.UnexpectedTensor, c.sum(stream, 0x1000_0004, 2560));
+    try expect(c.failed);
+}
+
+test "the box's failure record ends the pass, and an abort reaches the shared page" {
+    var d: cuda.Driver = undefined;
+    const page = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 4096);
+    defer std.testing.allocator.free(page);
+    @memset(page, 0);
+    var b = fakeBox(&d, page, 0, 2);
+    try b.check();
+    b.abort();
+    try expectEqual(@as(u32, 1), std.mem.readInt(u32, page[0..4], .little));
+    try std.testing.expectError(error.RankDisconnected, b.check());
 }
