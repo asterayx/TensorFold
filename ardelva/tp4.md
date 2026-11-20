@@ -18,8 +18,15 @@ computes a quarter of every layer.
   ranks, so the bytes do not depend on the rank count.
 - The routed experts: 128 whole experts a rank, summed over the ranks in fp32 where each value is another than +0
   on one rank alone.
-- The MTP head and the vocabulary projection: rank 0 alone. `TF_FLASHNEXT_SHARD_HEAD=1` is still a two-rank
-  feature (248,320 rows do not cut into four blocks of whole 256-row tiles) and is refused at four.
+- The MTP head: rank 0 alone.
+- The vocabulary projection: rank 0 alone, unless `TF_FLASHNEXT_SHARD_HEAD=1` gives every rank a run of its
+  256-row tiles (any rank count from 2 to 8). The 970 tiles do not divide by four: three ranks hold 243 tiles
+  (62,208 ids) and the last 241 (61,696). A gather wants equal blocks, so every rank sends 243 tiles' worth, the
+  last rank's block ending in 1,024 bytes that are not scores; the blocks land in a scratch row whose first
+  248,320 ids are the row in vocabulary order, and that much is copied to where the scores go. At two ranks the
+  halves are equal and the gather writes the row in place, as before. A row's gather is 124,416 bytes at four
+  ranks, inside the kernel path's limit. Each id's score is one rank's whole dot product either way, so the bytes
+  should not depend on the rank count. Not run on a GPU yet.
 
 At 3 or 5 to 8 ranks the heads do not divide, the split is off and every rank computes the whole dense layers; only
 the experts are spread.
