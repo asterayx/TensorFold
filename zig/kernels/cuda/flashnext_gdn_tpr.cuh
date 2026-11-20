@@ -127,3 +127,10 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr_h8(const floa
                                                                     float* state_out, int rows, float* ys_out) {
     gdn_tpr::chain<8, 24, 2, 16>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
 }
+
+// fn_gdn_chain_tpr on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr_h4(const float* qn, const float* kn, const float* v,
+                                                                    const float* gb, const float* state_in,
+                                                                    float* state_out, int rows, float* ys_out) {
+    gdn_tpr::chain<4, 12, 2, 16>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+}

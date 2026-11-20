@@ -255,3 +255,13 @@ extern "C" __global__ void __launch_bounds__(gdn_fused::THREADS) fn_gdn_fused_h8
     // the marks run with whole heads only: a rank's half set never cuts
     gdn_fused::run<8, 24, false>(P, cs, cw, a_log, dt_bias, state_in, state_out, rows, norm_w, eps, out, xs, ys_out, 0, nullptr, 0, nullptr);
 }
+
+// fn_gdn_fused on one of four ranks' 4 key and 12 value heads (ardelva).
+extern "C" __global__ void __launch_bounds__(gdn_fused::THREADS) fn_gdn_fused_h4(
+        const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, const float* state_in, float* state_out, int rows,
+        const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
+        float* __restrict__ ys_out) {
+    // the marks run with whole heads only: a rank's half set never cuts
+    gdn_fused::run<4, 12, false>(P, cs, cw, a_log, dt_bias, state_in, state_out, rows, norm_w, eps, out, xs, ys_out, 0, nullptr, 0, nullptr);
+}

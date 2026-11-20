@@ -15,6 +15,21 @@ pub const Heads = struct {
     /// One rank's half under the head split: key and value heads halved (1:3 kept), one KV head and its 12 queries.
     pub const half: Heads = .{ .nk = 8, .nv = 24, .q = 12, .kv = 1 };
 
+    /// One rank's quarter at four ranks: 4 key and 12 value heads, 6 queries and the one KV head they read. The
+    /// checkpoint has two KV heads, so two ranks hold each of them (ardelva; vLLM replicates KV heads likewise).
+    pub const quarter: Heads = .{ .nk = 4, .nv = 12, .q = 6, .kv = 1 };
+
+    /// The ranks a layer cut into `h` is shared between: 1 for the whole layer.
+    pub fn world(h: Heads) usize {
+        return full.nk / h.nk;
+    }
+
+    /// The first of the checkpoint's KV heads that rank `rank`'s queries read: each KV head serves q / kv queries
+    /// of the whole layer, in order.
+    pub fn kvFirst(h: Heads, rank: usize) usize {
+        return rank * h.q / (full.q / full.kv);
+    }
+
     pub fn eql(a: Heads, b: Heads) bool {
         return a.nk == b.nk and a.nv == b.nv and a.q == b.q and a.kv == b.kv;
     }
@@ -44,11 +59,13 @@ pub const Heads = struct {
         return h.kv * wt.head_dim * 2;
     }
 
-    /// What each of `world` ranks computes of a layer the head split cuts: the whole layer at one rank, half at two.
-    pub fn split(world: usize) error{UnevenHeadSplit}!Heads {
-        return switch (world) {
+    /// What each of `ranks` ranks computes of a layer the head split cuts: the whole layer at one rank, half at
+    /// two, a quarter at four.
+    pub fn split(ranks: usize) error{UnevenHeadSplit}!Heads {
+        return switch (ranks) {
             1 => .full,
             2 => .half,
+            4 => .quarter,
             else => error.UnevenHeadSplit,
         };
     }
@@ -59,7 +76,7 @@ comptime {
     std.debug.assert(f.nk == gdn.nk and f.nv == gdn.nv and f.q == wt.q_heads and f.kv == wt.kv_heads);
     std.debug.assert(f.convDim() == gdn.conv_dim and f.projWidth() == gdn.proj_width and f.valueDim() == gdn.value_dim);
     std.debug.assert(f.projN() == wt.proj_n and f.kvRow() == wt.kv_heads * wt.head_dim * 2);
-    for ([_]Heads{ f, Heads.half }) |h| std.debug.assert(h.q * wt.head_dim == h.valueDim() and h.nv == 3 * h.nk);
+    for ([_]Heads{ f, Heads.half, Heads.quarter }) |h| std.debug.assert(h.q * wt.head_dim == h.valueDim() and h.nv == 3 * h.nk);
 }
 
 test "the full heads' widths are the checkpoint constants they replace" {
@@ -83,9 +100,31 @@ test "half the heads: 5,120 conv channels, 8,240-wide DeltaNet rows, 3,072 value
     try std.testing.expectEqual(h.q / h.kv, Heads.full.q / Heads.full.kv);
 }
 
-test "one rank holds the whole layer, each of two half of it, and no other world splits" {
+test "one rank holds the whole layer, each of two half of it, each of four a quarter, and no other world splits" {
     try std.testing.expect((try Heads.split(1)).eql(.full));
     try std.testing.expect((try Heads.split(2)).eql(.half));
-    for ([_]usize{ 0, 3, 4 }) |w| try std.testing.expectError(error.UnevenHeadSplit, Heads.split(w));
+    try std.testing.expect((try Heads.split(4)).eql(.quarter));
+    for ([_]usize{ 0, 3, 5, 8 }) |w| try std.testing.expectError(error.UnevenHeadSplit, Heads.split(w));
     try std.testing.expect(!Heads.half.eql(.full));
+    for ([_]usize{ 1, 2, 4 }) |w| try std.testing.expectEqual(w, (try Heads.split(w)).world());
+}
+
+test "a quarter of the heads: 2,560 conv channels, 4,120-wide DeltaNet rows, 1,536 values, 4,224-wide attention rows" {
+    const h = Heads.quarter;
+    try std.testing.expectEqual(@as(usize, 2560), h.convDim());
+    try std.testing.expectEqual(@as(usize, 4120), h.projWidth());
+    try std.testing.expectEqual(@as(usize, 1536), h.valueDim());
+    try std.testing.expectEqual(@as(usize, 4224), h.projN());
+    try std.testing.expectEqual(@as(usize, 512), h.kvRow());
+}
+
+test "the KV head a rank's queries read: its own at one or two ranks, one for each pair of ranks at four" {
+    try std.testing.expectEqual(@as(usize, 0), Heads.full.kvFirst(0));
+    try std.testing.expectEqual([2]usize{ 0, 1 }, [2]usize{ Heads.half.kvFirst(0), Heads.half.kvFirst(1) });
+    try std.testing.expectEqual([4]usize{ 0, 0, 1, 1 }, [4]usize{ Heads.quarter.kvFirst(0), Heads.quarter.kvFirst(1), Heads.quarter.kvFirst(2), Heads.quarter.kvFirst(3) });
+    // every query of the whole layer reads the KV head its rank holds
+    for ([_]Heads{ .half, .quarter }) |h| for (0..h.world()) |rank| for (0..h.q) |i| {
+        const query = rank * h.q + i;
+        try std.testing.expectEqual(query / (Heads.full.q / Heads.full.kv), h.kvFirst(rank));
+    };
 }

@@ -74,6 +74,8 @@ pub const Kernels = struct {
     /// The DeltaNet kernels for the whole layer's heads and for a rank's half under the head split (gdnSet).
     gdn: Gdn,
     gdn_h8: Gdn,
+    /// The `_h4` twins: one of four ranks' quarter of the heads (ardelva).
+    gdn_h4: Gdn,
     /// TF_FLASHNEXT_KEEP_LATE (whole heads only): the front into a stream's pending-row log, the chain with them.
     front_log: cuda.Function,
     chain_late: cuda.Function,
@@ -136,6 +138,7 @@ pub const Kernels = struct {
         k.select_lanes = try k.batch.function("fn_qsa_select_lanes");
         k.gdn = try Gdn.load(k.batch, "");
         k.gdn_h8 = try Gdn.load(k.batch, "_h8");
+        k.gdn_h4 = try Gdn.load(k.batch, "_h4");
         k.front_log = try k.batch.function("fn_gdn_front_log");
         k.chain_late = try k.batch.function("fn_gdn_rows_late");
         k.lanes_keep = try k.batch.function("fn_gdn_lanes_keep");
@@ -157,10 +160,12 @@ pub const Kernels = struct {
         return @import("sys").environment.read(bool, "TF_FLASHNEXT_PROFILE", false) catch false;
     }
 
-    /// The DeltaNet kernels for a layer's heads `h`: the full set, or the `_h8` twins for half; any other is refused.
+    /// The DeltaNet kernels for a layer's heads `h`: the full set, the `_h8` twins for half or the `_h4` twins for a
+    /// quarter; any other is refused.
     pub fn gdnSet(k: *const Kernels, h: Heads) error{RowShape}!*const Gdn {
         if (h.eql(.full)) return &k.gdn;
         if (h.eql(.half)) return &k.gdn_h8;
+        if (h.eql(.quarter)) return &k.gdn_h4;
         return error.RowShape;
     }
 
@@ -197,5 +202,7 @@ test "a split layer's DeltaNet launches, the rollback replay's front and chain t
     try std.testing.expectEqual(k.gdn.front.handle, full.front.handle);
     try std.testing.expectEqual(k.gdn.chain.handle, full.chain.handle);
     inline for (names) |field| try std.testing.expect(@field(half, field).handle != @field(full, field).handle);
-    try std.testing.expectError(error.RowShape, k.gdnSet(.{ .nk = 4, .nv = 12, .q = 6, .kv = 1 }));
+    inline for (names, 0..) |field, i| @field(k.gdn_h4, field) = .{ .d = &driver, .handle = @ptrFromInt(0x300 + i) };
+    try std.testing.expectEqual(k.gdn_h4.front.handle, (try k.gdnSet(.quarter)).front.handle);
+    try std.testing.expectError(error.RowShape, k.gdnSet(.{ .nk = 2, .nv = 6, .q = 3, .kv = 1 }));
 }
