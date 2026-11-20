@@ -21,7 +21,7 @@ pub fn explain(err: anyerror) ?[]const u8 {
         error.FlashNextPagesUnsupported => "TF_FLASHNEXT_KV_PAGES needs one rank, our own glue and no --slide: unset it",
         error.UnsupportedCheckpoint => "the checkpoint differs from the supported Flash Next CUDA layout; the log names its config field",
         error.BadCollectiveBox => "TF_FLASHNEXT_COLLECTIVE_BOX takes 0 or 1, and TF_FLASHNEXT_COLLECTIVE_BOX_KB a number of KiB from 4 to 1024",
-        error.BadCollectiveSpin => "TF_FLASHNEXT_COLLECTIVE_SPIN_US takes microseconds from 0 (sleep between looks, the default) to 10000",
+        error.BadCollectiveSpin => "TF_FLASHNEXT_COLLECTIVE_SPIN_US takes microseconds from 0 (sleep between looks) to 10000; unset is 200",
         error.BadDenseSplit => "TF_FLASHNEXT_SPLIT_DENSE takes 1 (split the BF16 dense projections at --tp 2, the default) or 0",
         error.DecodeGraphWithDenseSplit => "TF_FLASHNEXT_DECODE_GRAPH is not qualified with the dense split: unset it or set TF_FLASHNEXT_SPLIT_DENSE=0",
         error.RankDisconnected, error.RankTimeout, error.RemoteRank, error.BadRankFrame => "a tensor-parallel rank failed; restart both ranks from the same checkpoint before retrying",

@@ -4,7 +4,7 @@
 //! and reads the other ranks'. A collective is then one launch on the pass's stream. NCCL keeps what does not fit
 //! (`limit`), the reduce-scatter and the broadcast.
 //!
-//! Off unless TF_FLASHNEXT_COLLECTIVE_BOX=1 on every rank. A rank that cannot set it up says so to the others and
+//! On unless TF_FLASHNEXT_COLLECTIVE_BOX=0 on some rank. A rank that cannot set it up says so to the others and
 //! all of them stay on NCCL: which path a collective takes depends on its size alone, the same on every rank.
 const std = @import("std");
 const cuda = @import("cuda");
@@ -33,9 +33,11 @@ pub const Args = extern struct {
     seq: u32,
 };
 
-/// TF_FLASHNEXT_COLLECTIVE_BOX: 1 asks for the kernel path, unset or 0 keeps every collective on NCCL.
+/// TF_FLASHNEXT_COLLECTIVE_BOX: unset or 1 asks for the kernel path, 0 keeps every collective on NCCL.
+/// On xzss at --tp 2 with the dense split it took a decode forward from 14.5 to 11.8 ms, with the same tokens
+/// (asterayx/TensorFold#6).
 pub fn setting(value: ?[]const u8) !bool {
-    const v = value orelse return false;
+    const v = value orelse return true;
     if (std.mem.eql(u8, v, "0")) return false;
     if (std.mem.eql(u8, v, "1")) return true;
     return error.BadCollectiveBox;
@@ -129,7 +131,7 @@ pub const Box = struct {
         }
         if (go[0] != 1) {
             if (box) |*b| b.close();
-            if (want and rank == 0) std.log.warn("flashnext: TF_FLASHNEXT_COLLECTIVE_BOX=1 but not every rank could set it up; every collective stays on NCCL", .{});
+            if (want and rank == 0) std.log.warn("flashnext: not every rank could set up the collectives' kernel path (or one has TF_FLASHNEXT_COLLECTIVE_BOX=0); every collective stays on NCCL", .{});
             return null;
         }
         if (rank == 0) std.log.info("flashnext: collectives of at most {d} KiB a rank go through one kernel a rank, the rest through NCCL", .{limit / 1024});
@@ -200,8 +202,8 @@ pub const Box = struct {
     }
 };
 
-test "the box settings: off unless 1, a limit of 4 to 1024 KiB" {
-    try std.testing.expect(!try setting(null));
+test "the box settings: on unless 0, a limit of 4 to 1024 KiB" {
+    try std.testing.expect(try setting(null));
     try std.testing.expect(!try setting("0"));
     try std.testing.expect(try setting("1"));
     try std.testing.expectError(error.BadCollectiveBox, setting("yes"));
