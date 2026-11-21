@@ -8,6 +8,8 @@ pub const Backend = enum {
     nccl,
     /// Exchanges of at most `mailbox_max_bytes` a rank through the one-shot mailbox kernel, NCCL above that.
     mailbox,
+    /// The mailbox's split for 2 to 8 ranks of one host: a rank writes once, into an outbox every rank reads.
+    outbox,
     /// The same split between two hosts: the small exchanges over RoCE (doorbell + RDMA proxy), NCCL above.
     roce,
 };
@@ -16,6 +18,10 @@ pub const Backend = enum {
 pub const Fallback = enum { nccl, @"error" };
 
 pub const Error = error{BadSetting};
+
+/// TF_TP_MAILBOX_MAX_KB's default on the outbox backend. Measured on four RTX PRO 5000 (asterayx/TensorFold#1): the
+/// outbox was the faster at 5 and 10 KiB a rank and NCCL at 40 KiB; where between them they cross was not measured.
+pub const outbox_default_kb = 16;
 
 /// RoCE's per-write cap (roce_guard.max_write): on the roce backend a slot past it fails boot, never clamped.
 pub const max_rdma_write: usize = @import("roce_guard.zig").max_write;
@@ -103,10 +109,11 @@ pub const Config = struct {
         c.device = try int(u32, get, "TF_TP_DEVICE", c.device, 0, 63);
         const backend = "TF_COMM_BACKEND";
         if (get(backend)) |b| c.backend = std.meta.stringToEnum(Backend, std.mem.trim(u8, b, " ")) orelse {
-            log.warn("{s}={s}: expected nccl, mailbox or roce", .{ backend, b });
+            log.warn("{s}={s}: expected nccl, mailbox, outbox or roce", .{ backend, b });
             return error.BadSetting;
         };
-        c.mailbox_max_bytes = 1024 * try int(usize, get, "TF_TP_MAILBOX_MAX_KB", 256, 4, 16 * 1024);
+        // the outbox's default is small: on four cards NCCL was the faster from 40 KiB a rank up (outbox_default_kb)
+        c.mailbox_max_bytes = 1024 * try int(usize, get, "TF_TP_MAILBOX_MAX_KB", if (c.backend == .outbox) outbox_default_kb else 256, 4, 16 * 1024);
         if (c.backend == .roce and c.mailbox_max_bytes > max_rdma_write) {
             log.warn("TF_TP_MAILBOX_MAX_KB={d}: a RoCE write is capped at {d} KiB; refusing to start", .{ c.mailbox_max_bytes / 1024, max_rdma_write / 1024 });
             return error.BadSetting;
@@ -284,6 +291,17 @@ test "bad settings are refused and the digest ignores the rank" {
     try std.testing.expectEqualSlices(u8, &a.digest(), &b.digest());
     b.mailbox_max_bytes = 1024;
     try std.testing.expect(!std.mem.eql(u8, &a.digest(), &b.digest()));
+}
+
+test "the outbox's small route ends at 16 KiB unless the setting says otherwise" {
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "outbox" }, .{ "TF_TP_WORLD", "4" } };
+    const a = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(Backend.outbox, a.backend);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), a.mailbox_max_bytes);
+    Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "outbox" }, .{ "TF_TP_MAILBOX_MAX_KB", "64" } };
+    try std.testing.expectEqual(@as(usize, 64 * 1024), (try Config.parse(&Fake.get)).mailbox_max_bytes);
+    Fake.pairs = &.{.{ "TF_COMM_BACKEND", "mailbox" }};
+    try std.testing.expectEqual(@as(usize, 256 * 1024), (try Config.parse(&Fake.get)).mailbox_max_bytes);
 }
 
 test "the plan link's spin and pin, the RoCE grid cap" {

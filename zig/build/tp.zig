@@ -36,6 +36,7 @@ fn mailboxFatbin(b: *std.Build, nvcc: []const u8) std.Build.LazyPath {
     const out = run.addOutputFileArg("tp_mailbox.fatbin");
     run.addFileArg(b.path("zig/src/fabric/tp/mailbox.cu"));
     _ = run.addFileInput(b.path("zig/src/fabric/tp/roce_device.cuh"));
+    _ = run.addFileInput(b.path("zig/src/fabric/tp/outbox.cuh"));
     return out;
 }
 

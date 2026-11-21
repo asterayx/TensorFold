@@ -12,6 +12,7 @@ const Error = collective.Error;
 /// The one-kernel path for small shards: both expose the same calls.
 pub const Small = union(enum) {
     mailbox: *Mailbox,
+    outbox: *@import("outbox.zig").Outbox,
     roce: *Roce,
     roce_multi: *@import("roce_multi.zig").Roce,
 
@@ -68,7 +69,7 @@ pub const Hybrid = struct {
     var_agreed: bool = false,
 
     pub fn iface(h: *Hybrid) collective.Collective {
-        return .{ .ptr = h, .vtable = if (h.small == .mailbox) &mailbox_vtable else &roce_vtable };
+        return .{ .ptr = h, .vtable = if (h.small == .mailbox or h.small == .outbox) &mailbox_vtable else &roce_vtable };
     }
 
     fn vtable(comptime kind: collective.Kind) collective.Collective.VTable {
@@ -97,6 +98,15 @@ pub const Hybrid = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// Whether the small path adds: not the multirank RoCE one, and the outbox at two ranks only.
+    pub fn sumsSmall(h: *const Hybrid) bool {
+        return switch (h.small) {
+            .roce_multi => false,
+            .outbox => |p| p.sums(),
+            .mailbox, .roce => true,
+        };
+    }
+
     fn routed(h: *const Hybrid, n: usize) bool {
         return n <= h.max_bytes and h.small.fits(n);
     }
@@ -111,7 +121,7 @@ pub const Hybrid = struct {
 
     fn allReduce(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, op: Op, stream: collective.Stream) Error!void {
         const h = self_(ptr);
-        if (h.small != .roce_multi and op == .sum and (t == .f32 or t == .bf16) and h.routed(count * t.size())) return h.small.sum(s, r, count, t, stream);
+        if (h.sumsSmall() and op == .sum and (t == .f32 or t == .bf16) and h.routed(count * t.size())) return h.small.sum(s, r, count, t, stream);
         return Nccl.allReduce(h.nccl, s, r, count, t, op, stream);
     }
 
@@ -128,12 +138,12 @@ pub const Hybrid = struct {
         if (singleFits(h, n)) return switch (h.small) {
             .roce => |p| p.allGatherV(s, r, n, lens, stream),
             .roce_multi => |p| p.allGatherV(s, r, n, lens, stream),
-            .mailbox => unreachable,
+            .mailbox, .outbox => unreachable,
         };
         if (varFits(ptr, n)) return switch (h.small) {
             .roce => |p| p.allGatherVChunked(s, r, n, lens, stream),
             .roce_multi => |p| p.allGatherVChunked(s, r, n, lens, stream),
-            .mailbox => unreachable,
+            .mailbox, .outbox => unreachable,
         };
         return allGather(ptr, s, r, stride, t, stream);
     }
@@ -141,7 +151,7 @@ pub const Hybrid = struct {
     fn singleFits(h: *const Hybrid, n: usize) bool {
         return switch (h.small) {
             inline .roce, .roce_multi => |p| n > 0 and h.routed(n) and p.d != null,
-            .mailbox => false,
+            .mailbox, .outbox => false,
         };
     }
 
@@ -152,7 +162,7 @@ pub const Hybrid = struct {
         const single = singleFits(h, n);
         return single or switch (h.small) {
             inline .roce, .roce_multi => |p| chunkRoute(h.chunked_bytes, n, single, p.d != null and p.chunk_abi),
-            .mailbox => false,
+            .mailbox, .outbox => false,
         };
     }
 
@@ -163,7 +173,7 @@ pub const Hybrid = struct {
     fn exchange(ptr: *anyopaque, s: DevicePtr, r: DevicePtr, count: usize, t: DType, peer: u32, stream: collective.Stream) Error!void {
         const h = self_(ptr);
         try collective.checkPeer(h.nccl.me, h.nccl.size, peer);
-        if (h.small != .roce_multi and h.routed(count * t.size())) return h.small.exchange(s, r, count * t.size(), stream);
+        if (h.small != .roce_multi and h.small != .outbox and h.routed(count * t.size())) return h.small.exchange(s, r, count * t.size(), stream);
         return Nccl.exchange(h.nccl, s, r, count, t, peer, stream);
     }
 

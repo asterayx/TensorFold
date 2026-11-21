@@ -18,6 +18,7 @@ pub const hip_rig = @import("hip_rig.zig"); // tf-tp-test's tcp-hip opens the HI
 pub const nccl = @import("nccl.zig");
 pub const group = @import("group.zig");
 pub const mailbox = @import("mailbox.zig");
+pub const outbox = @import("outbox.zig");
 pub const hybrid = @import("hybrid.zig");
 pub const roce = @import("roce.zig");
 pub const roce_multi = @import("roce_multi.zig");
@@ -41,6 +42,7 @@ pub const Session = struct {
     lib: cuda.nccl.Library,
     nccl: nccl.Nccl,
     mail: ?mailbox.Mailbox = null,
+    out: ?outbox.Outbox = null,
     roce: ?*roce.Roce = null,
     roce_multi: ?*roce_multi.Roce = null,
     route: hybrid.Hybrid = undefined,
@@ -56,6 +58,7 @@ pub const Session = struct {
         try b.agree(&cfg.digest(), "settings (TF_TP_WORLD, TF_COMM_BACKEND, TF_TP_MAILBOX_MAX_KB, TF_TP_ROCE_RELAY_MAX_KB, TF_TP_ROCE_CHUNKED_KB, TF_TP_FAILFAST, TF_TP_ROCE_WIRE / _FALLBACK, TF_GRAPH_CACHE)");
         var diag = cuda.p2p_report.begin(cfg.rank, cfg.world);
         defer diag.end();
+        if (cfg.backend == .outbox) nccl.allowPeerAcrossCpus();
         var lib = try cuda.nccl.Library.openPath(cfg.nccl_lib);
         errdefer lib.close();
         const v = try lib.version();
@@ -67,6 +70,7 @@ pub const Session = struct {
         s.nccl = try nccl.Nccl.init(&s.lib, d, id, cfg.rank, cfg.world);
         errdefer s.nccl.deinit();
         errdefer if (s.mail) |*m| m.deinit();
+        errdefer if (s.out) |*m| m.deinit();
         errdefer if (s.roce) |rr| rr.deinit();
         errdefer if (s.roce_multi) |rr| rr.deinit();
         switch (cfg.backend) {
@@ -76,6 +80,12 @@ pub const Session = struct {
                 s.route = .{ .small = .{ .mailbox = &s.mail.? }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes };
             } else if (cfg.rank == 0) {
                 log.warn("[tensorfold] tp: TF_COMM_BACKEND=mailbox needs two ranks on one host and the kernel; every rank uses NCCL", .{});
+            },
+            .outbox => if (try outboxPossible(&b, kernel_image)) {
+                s.out = try outbox.Outbox.init(d, &b, kernel_image, cfg.mailbox_max_bytes, cfg.mailbox_timeout_ns);
+                s.route = .{ .small = .{ .outbox = &s.out.? }, .nccl = &s.nccl, .max_bytes = cfg.mailbox_max_bytes };
+            } else if (cfg.rank == 0) {
+                log.warn("[tensorfold] tp: TF_COMM_BACKEND=outbox needs 2 to {d} ranks on one host and a kernel image with tp_outbox; every rank uses NCCL", .{outbox.max_ranks});
             },
             .roce => if (cfg.world == 2) try s.openRoce(d, &b, kernel_image) else try @import("roce_multi_session.zig").open(s, d, &b, kernel_image),
         }
@@ -129,7 +139,7 @@ pub const Session = struct {
         const all = try b.allGather(&.{@intFromBool(s.comm().varFits(16))}, &buf, &blobs);
         var ok = true;
         for (all) |x| ok = ok and x[0] == 1;
-        if (s.mail != null or s.roce != null or s.roce_multi != null) s.route.var_agreed = ok;
+        if (s.mail != null or s.out != null or s.roce != null or s.roce_multi != null) s.route.var_agreed = ok;
     }
 
     fn roceFallback(s: *Session, e: anyerror) !void {
@@ -177,6 +187,21 @@ pub const Session = struct {
         return all[0][0] == 1 and std.mem.eql(u8, all[0], all[1]);
     }
 
+    /// Every rank on one host, each with a kernel image that carries tp_outbox.
+    fn outboxPossible(b: *Bootstrap, image: []const u8) !bool {
+        if (b.world < 2 or b.world > outbox.max_ranks) return false;
+        var id_buf: [64]u8 = undefined;
+        const id = sock.hostId(&id_buf);
+        var mine: [65]u8 = @splat(0);
+        mine[0] = @intFromBool(std.mem.indexOf(u8, image, "tp_outbox") != null);
+        @memcpy(mine[1..][0..id.len], id);
+        var blobs: [bootstrap.max_ranks][]const u8 = undefined;
+        var buf: [outbox.max_ranks * 65]u8 = undefined;
+        const all = try b.allGather(&mine, &buf, &blobs);
+        for (all) |x| if (x[0] != 1 or !std.mem.eql(u8, x, all[0])) return false;
+        return true;
+    }
+
     fn abortHook(ctx: *anyopaque, _: []const u8) void {
         const s: *Session = @ptrCast(@alignCast(ctx));
         s.comm().abort();
@@ -184,7 +209,7 @@ pub const Session = struct {
 
     /// The communicator the model uses: NCCL, or the hybrid route over the mailbox / RoCE.
     pub fn comm(s: *Session) Collective {
-        if (s.mail != null or s.roce != null or s.roce_multi != null) return s.route.iface();
+        if (s.mail != null or s.out != null or s.roce != null or s.roce_multi != null) return s.route.iface();
         return s.nccl.iface();
     }
 
@@ -221,6 +246,7 @@ pub const Session = struct {
         if (s.roce) |r| r.deinit();
         if (s.roce_multi) |r| r.deinit();
         if (s.mail) |*m| m.deinit();
+        if (s.out) |*m| m.deinit();
         s.nccl.deinit();
         s.lib.close();
     }
@@ -234,6 +260,7 @@ test {
     _ = sock;
     _ = bootstrap;
     _ = mailbox;
+    _ = outbox;
     _ = roce_verbs;
     _ = roce_pick;
     _ = planlink;
